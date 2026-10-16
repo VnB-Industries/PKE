@@ -230,6 +230,17 @@ void sendDoorFrame(const uint8_t* data) {
   recoverCanIfNeeded();
   if (!canReady) return;
 
+  // Don't launch a door frame into a bus in deep sleep. With auto-retransmit on (needed so a send
+  // survives NM-cycle gaps on an awake bus), an unacknowledged frame stays in the MCP2515 TX buffer
+  // and fires the instant the ECU wakes - a stale lock/unlock on wake. abortTX() can't clear it
+  // cleanly here: this lib leaves the CANCTRL ABAT bit set with no way to clear it, which would
+  // abort every later send too. So gate on bus state. The NM frame ticks ~1 Hz in the responsive
+  // window, so busLooksAwake() stays true there and the quiet-stretch sends above still happen.
+  if (!busLooksAwake()) {
+    DEBUG_PRINTLN(F("[door] bus in deep sleep, command dropped (would fire on wake)"));
+    return;
+  }
+
   for (uint8_t attempt = 1; attempt <= DOOR_MAX_RETRIES; attempt++) {
     byte result = CAN0.sendMsgBuf(DOOR_CMD_ID, 0, 8, const_cast<uint8_t*>(data));
     if (result == CAN_OK) {

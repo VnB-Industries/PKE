@@ -92,7 +92,19 @@ Four wake attempts failed: an OBD-II request on `0x7DF`, a burst of the steady-s
 - **Lock works today.** You lock seconds after walking away, well inside the responsive window.
 - **Unlock on return does not**, once the car has sat. That is the whole remaining problem.
 
-The honest fix is to wake the body ECU the way the car does: **drive its hardwired wake input** (a door courtesy switch line). Zero standby drain, works indefinitely, but it means tapping the car's wiring rather than living on the OBD port.
+The fix is to wake the body ECU the way the car does: **drive its hardwired wake input** — the driver's door jamb switch, Toyota **84231-60070**. Zero standby drain, works indefinitely, but it means tapping the car's wiring rather than living on the OBD port.
+
+### The jamb switch line
+
+A single wire at battery voltage: the body ECU holds one state through an internal pull-up, and the switch's own metal body grounds it to the jamb in the other. A relay wired across that switch and pulsed makes the ECU see a door opening. Wiring, the topology measurement and the board checks are in [../Pin-diagram.md](../Pin-diagram.md); the pulse is implemented as the `wake` command in [../obd-tool](../obd-tool/README.md).
+
+Pulse a train, not once — Toyota's service procedure for a sleeping main body ECU is *open the driver door, then open and close a door several times at ~1.5 s intervals*.
+
+What is established, what isn't, and the test that closes the gap:
+
+- **A door opening does wake it**, with the car fob-locked, and **no alarm sounded** — so the theft deterrent, which reads this same switch, does not veto the approach. That was the risk that would have killed it.
+- **Which input woke it is not yet isolated.** The observation was a door opened *from inside*, which closes the jamb switch **and** pulls the latch and lock linkage — and on a Toyota the first pull of the inside handle unlocks the door. That is also a plausible alternative explanation for the silent alarm, since an inside-handle unlock is a legitimate disarm.
+- **The test that settles it needs no electrical access:** tape the jamb switch plunger down (door physically open, car believes it closed), fob-lock, wait for deep sleep, then release the plunger. The latch never moves, no handle is touched, and releasing the plunger is electrically identical to what the relay will do. If the ECU sleeps with the plunger held, the courtesy switch is also confirmed as the input that governs sleep. Run this before splicing anything into the A-pillar.
 
 A keepalive remains theoretically possible — injecting NM frames *during* the responsive window to extend it — but it cannot help after deep sleep, `0x45A` collides with the real gateway while it is awake, and holding the network up drains a 45 Ah hybrid aux battery. Not recommended.
 
