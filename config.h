@@ -112,7 +112,5 @@ static const uint32_t RELAY_WAKE_TIMEOUT_MS = 8000; // after the train, wait thi
 #define I2S_SCK_PIN  33
 #define I2S_SD_PIN   32
 #define I2S_PORT     I2S_NUM_0
-
-#define SAMPLE_RATE_HZ 16000
-#define BLOCK_SIZE     128   // power of 2 (also the FFT size)
-#define SAMPLE_SHIFT   6     // adjust if the signal saturates or is too weak
+// Sample rate, detection and validation thresholds live in src/tap_config.h (copied from
+// ../tapDetector, tuned from recordings).

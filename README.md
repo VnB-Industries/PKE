@@ -8,6 +8,8 @@ ESP32 firmware that unlocks the car on a **double tap** and locks it on a **trip
 
 Combines [../tapDetector](../tapDetector) (tap detection) and [../obd-tool](../obd-tool) (CAN door frames).
 
+The tap detector sources in `src/` are a copy of [../tapDetector/src](../tapDetector/src): onset detector in an audio task on core 0, temporal and FFT validation of each event, then timing pattern matching. After retuning thresholds or rebuilding the template there, copy `src/` over again.
+
 ## Hardware
 
 - ESP32 DevKit
@@ -18,16 +20,16 @@ No pin conflicts between the two.
 
 ## Build
 
-Arduino IDE with the ESP32 core, plus libraries `arduinoFFT` (v2.x) and `MCP_CAN_lib` (coryjfowler). Set `MCP_OSC_FREQ` in `config.h` to match your module's crystal. Serial monitor at 115200.
+Arduino IDE with the ESP32 core, plus library `MCP_CAN_lib` (coryjfowler). Set `MCP_OSC_FREQ` in `config.h` to match your module's crystal. Serial monitor at 115200.
 
 ## Behaviour
 
 | Gesture | Action |
 | --- | --- |
-| 2 taps, 150–600 ms apart, then 1 s of silence | unlock |
-| 3 taps, 150–700 ms between each | lock |
+| 2 taps, 150–600 ms apart | unlock |
+| 3 taps, 150–700 ms between each, gaps within ±30% of each other | lock |
 
-The 1 s silence after a double tap is what lets a third tap turn it into a lock instead. The cost is a 1 s delay before unlock.
+A gesture is only matched after 1.2 s of silence following its last tap. That is what lets a third tap turn an unlock into a lock, and it makes a fourth tap cancel the gesture. The cost is a 1.2 s delay before either command.
 
 LED: fast blink = CAN not ready, slow blink = on-bus, solid 1 s = command acknowledged, 2 s stutter = command not delivered.
 
@@ -118,7 +120,7 @@ A keepalive remains theoretically possible — injecting NM frames *during* the 
 
 ## Calibration
 
-Thresholds are copied from tapDetector and depend on your mic gain and the car window. Set `ENVELOPE_DEBUG = true` in `PKE.ino` and use the Serial Plotter to tune `RMS_THRESHOLD`, `PEAK_THRESHOLD` and the release thresholds.
+Thresholds live in `src/tap_config.h` and the spectral template in `src/tap_template.h`. Both depend on the mic gain and the car window. Every detected event is logged as an `EVT` line with its features and the reason it was rejected, if any. Tune from recordings following [../tapDetector/TAP_TRAINING_PROCESS.md](../tapDetector/TAP_TRAINING_PROCESS.md), then copy the updated `src/` here.
 
 ## Safety
 

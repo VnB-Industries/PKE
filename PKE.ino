@@ -4,96 +4,54 @@
   Double tap on the window -> unlock the car
   Triple tap on the window -> lock the car
 
-  Tap detection comes from tapDetector (RMS/peak trigger, FFT signature check,
-  impact duration check, temporal pattern matching).
+  Tap detection comes from tapDetector (src/, copied from ../tapDetector/src):
+  per-sample onset detector in an audio task, temporal + FFT validation of each
+  event, then a timing pattern matcher over the whole tap sequence.
   CAN door frames come from obd-tool (raw 11-bit frame on ID 0x750).
 
   Wiring: see config.h and ../obd-tool/README.md (MCP2515) and
-  ../tapDetector/tapDetector.ino (INMP441).
+  ../tapDetector/README.md (INMP441).
 
-  Libraries: arduinoFFT v2.x (Enrique Condes), MCP_CAN_lib (coryjfowler).
+  Libraries: MCP_CAN_lib (coryjfowler).
 */
 
 #include <SPI.h>
 #include <mcp_can.h>
 #include <driver/i2s.h>
-#include <arduinoFFT.h>
 
 #include "config.h"
+#include "src/detector.h"
+#include "src/tap_features.h"
+#include "src/pattern.h"
 
-// ---------------------------------------------------------------------------
-// TAP DETECTION THRESHOLDS (calibrate with ENVELOPE_DEBUG, see tapDetector)
-// ---------------------------------------------------------------------------
-float RMS_THRESHOLD  = 800000.0f;
-float PEAK_THRESHOLD = 1400000.0f;
-
-#define BAND_LOW_HZ   200.0f
-#define BAND_HIGH_HZ  1600.0f
-float SPECTRAL_MIN_RATIO = 0.60f;
-
-#define EXCLUSION_LOW_HZ   2000.0f
-#define EXCLUSION_HIGH_HZ  6000.0f
-float EXCLUSION_MAX_RATIO = 0.12f;
-
-unsigned long MAX_IMPACT_DURATION_MS = 100;
-
-float RMS_RELEASE_THRESHOLD  = RMS_THRESHOLD  * 0.4f;
-float PEAK_RELEASE_THRESHOLD = PEAK_THRESHOLD * 0.6f;
-
-unsigned long MIN_REFRACTORY_MS = 30;
-
-bool ENVELOPE_DEBUG = false;
-bool debugEnabled = true;
+constexpr size_t kDmaBlock = 256;       // samples per I2S read (16 ms)
+constexpr float kRawToFloat = 1.0f / 2147483648.0f;  // 24-bit data, left-justified in 32 bits
+constexpr uint8_t kEventQueueLength = 3;
 
 // ---------------------------------------------------------------------------
 // PATTERNS -> ACTIONS
 // ---------------------------------------------------------------------------
-#define SILENT_END 1000 // a double tap is only confirmed after this much silence,
-                        // so that a third tap can still turn it into a triple tap
+// A sequence is only matched after this much silence, so a third tap can still turn a double tap
+// into a triple tap. Both gestures therefore fire this long after their last tap.
+constexpr uint32_t kSequenceEndMs = 1200;
 
-enum DoorAction { ACTION_UNLOCK, ACTION_LOCK };
-
-struct GapWindow { unsigned long minMs; unsigned long maxMs; };
-
-const GapWindow PATTERN_DOUBLE[] = { { 150, 600 } };
-const GapWindow PATTERN_TRIPLE[] = { { 150, 700 }, { 150, 700 } };
-
-struct TocPattern {
-  const char* name;
-  const GapWindow* gaps;
-  uint8_t gapCount;
-  unsigned long trailingSilenceMs;
-  DoorAction action;
+const tap::TapPattern kPatterns[] = {
+  // name           taps  relative gaps  tolerance  gap min-max (ms)
+  {"double tap",    2,    {1},           0.30f,     150, 600},
+  {"triple tap",    3,    {1, 1},        0.30f,     150, 700},
 };
-
-#define MAKE_PATTERN(nameStr, arr, silenceMs, act) \
-  { nameStr, arr, sizeof(arr) / sizeof(GapWindow), silenceMs, act }
-
-TocPattern PATTERNS[] = {
-  MAKE_PATTERN("double tap", PATTERN_DOUBLE, SILENT_END, ACTION_UNLOCK),
-  MAKE_PATTERN("triple tap", PATTERN_TRIPLE, 0,          ACTION_LOCK),
-};
-const uint8_t PATTERN_COUNT = sizeof(PATTERNS) / sizeof(TocPattern);
-
-struct PatternState {
-  uint8_t step;
-  unsigned long lastMs;
-  bool pending;
-};
-PatternState patternStates[PATTERN_COUNT];
+const uint8_t* const kPatternActions[] = { UNLOCK_CMD_DATA, LOCK_CMD_DATA };  // same order as kPatterns
 
 // ---------------------------------------------------------------------------
-// BUFFERS (no dynamic allocation)
+// TAP DETECTION STATE
 // ---------------------------------------------------------------------------
-int32_t samples[BLOCK_SIZE];
-double  fftReal[BLOCK_SIZE];
-double  fftImag[BLOCK_SIZE];
-ArduinoFFT<double> FFT = ArduinoFFT<double>(fftReal, fftImag, (uint_fast16_t)BLOCK_SIZE, (double)SAMPLE_RATE_HZ);
+volatile uint32_t audioNowMs = 0;
+volatile uint32_t droppedEvents = 0;
 
-unsigned long lastTocMs = 0;
-bool inImpact = false;
-unsigned long impactStartMs = 0;
-bool tocPendingValidation = false;
+QueueHandle_t eventQueue;
+tap::Detector detector;
+tap::ValidatorConfig validatorConfig;
+tap::PatternMatcher matcher(kPatterns, sizeof(kPatterns) / sizeof(kPatterns[0]), kSequenceEndMs);
 
 // ---------------------------------------------------------------------------
 // CAN
@@ -360,19 +318,22 @@ void updateLed() {
   }
 }
 
+
 // ---------------------------------------------------------------------------
-// I2S
+// AUDIO TASK: reads I2S without interruption, runs only the cheap per-sample
+// detector, and hands event snippets to loop(). Running on its own core, it
+// keeps reading while loop() blocks on a CAN send.
 // ---------------------------------------------------------------------------
 void setupI2S() {
   i2s_config_t cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = SAMPLE_RATE_HZ,
+    .sample_rate = tap::kSampleRate,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 8,
-    .dma_buf_len = 256,
+    .dma_buf_len = kDmaBlock,
     .use_apll = false,
     .tx_desc_auto_clear = false,
     .fixed_mclk = 0
@@ -388,226 +349,105 @@ void setupI2S() {
   i2s_zero_dma_buffer(I2S_PORT);
 }
 
-size_t readBlock() {
-  size_t bytesRead = 0;
-  i2s_read(I2S_PORT, (void*)samples, BLOCK_SIZE * sizeof(int32_t), &bytesRead, portMAX_DELAY);
-  return bytesRead / sizeof(int32_t);
-}
+void audioTask(void*) {
+  static int32_t raw[kDmaBlock];
+  static tap::TapEvent event;  // too big for the task stack
 
-// ---------------------------------------------------------------------------
-// SIGNAL ANALYSIS
-// ---------------------------------------------------------------------------
-void computeRmsPeak(size_t count, float &rms, float &peak) {
-  double sumSq = 0.0;
-  int32_t pk = 0;
-  for (size_t i = 0; i < count; i++) {
-    int32_t v = samples[i] >> SAMPLE_SHIFT;
-    sumSq += (double)v * (double)v;
-    int32_t av = v < 0 ? -v : v;
-    if (av > pk) pk = av;
-  }
-  rms = (count > 0) ? sqrt(sumSq / count) : 0.0f;
-  peak = (float)pk;
-}
+  for (;;) {
+    size_t bytesRead = 0;
+    i2s_read(I2S_PORT, raw, sizeof(raw), &bytesRead, portMAX_DELAY);
+    size_t n = bytesRead / sizeof(int32_t);
 
-// FFT only runs once a peak has been detected (expensive)
-void computeSpectralRatios(size_t count, float &bandRatio, float &exclusionRatio) {
-  bandRatio = 0.0f;
-  exclusionRatio = 0.0f;
-  if (count < BLOCK_SIZE) return;
-
-  for (uint16_t i = 0; i < BLOCK_SIZE; i++) {
-    fftReal[i] = (double)(samples[i] >> SAMPLE_SHIFT);
-    fftImag[i] = 0.0;
-  }
-
-  FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
-  FFT.compute(FFTDirection::Forward);
-  FFT.complexToMagnitude();
-
-  double bandEnergy = 0.0, exclusionEnergy = 0.0, totalEnergy = 0.0;
-  double freqPerBin = (double)SAMPLE_RATE_HZ / BLOCK_SIZE;
-
-  for (uint16_t bin = 1; bin < BLOCK_SIZE / 2; bin++) {
-    double freq = bin * freqPerBin;
-    double energy = fftReal[bin] * fftReal[bin];
-    totalEnergy += energy;
-    if (freq >= BAND_LOW_HZ && freq < BAND_HIGH_HZ) bandEnergy += energy;
-    if (freq >= EXCLUSION_LOW_HZ && freq < EXCLUSION_HIGH_HZ) exclusionEnergy += energy;
-  }
-
-  if (totalEnergy > 0.0) {
-    bandRatio = (float)(bandEnergy / totalEnergy);
-    exclusionRatio = (float)(exclusionEnergy / totalEnergy);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// PATTERN MATCHING
-// ---------------------------------------------------------------------------
-// after an action fires, taps are ignored for this long so that trailing/extra taps
-// of the same gesture can't start a new one (e.g. a 4th tap right after a triple)
-#define POST_ACTION_LOCKOUT_MS 700
-unsigned long lockoutUntil = 0;
-
-void resetAllPatterns() {
-  for (uint8_t p = 0; p < PATTERN_COUNT; p++) {
-    patternStates[p].step = 0;
-    patternStates[p].pending = false;
-  }
-}
-
-void onPatternRecognized(const TocPattern &pat) {
-  resetAllPatterns();
-  DEBUG_PRINTF("=== %s -> %s ===\n", pat.name, pat.action == ACTION_UNLOCK ? "UNLOCK" : "LOCK");
-  sendDoorFrame(pat.action == ACTION_UNLOCK ? UNLOCK_CMD_DATA : LOCK_CMD_DATA);
-
-  // waking the bus can block for a second or so, during which the I2S DMA ring keeps filling and
-  // then overflows. Drop that backlog so stale audio can't be read back as a fresh tap, and start
-  // the lockout from here rather than from before the send.
-  i2s_zero_dma_buffer(I2S_PORT);
-  lockoutUntil = millis() + POST_ACTION_LOCKOUT_MS;
-  if (lastSendOk) ledSolidUntil = millis() + 1000;
-  else            ledErrorUntil = millis() + 2000;
-}
-
-void checkPatternConfirmations(unsigned long now) {
-  for (uint8_t p = 0; p < PATTERN_COUNT; p++) {
-    PatternState &st = patternStates[p];
-    if (st.pending && (now - st.lastMs) >= PATTERNS[p].trailingSilenceMs) {
-      onPatternRecognized(PATTERNS[p]);
-      return;
+    for (size_t i = 0; i < n; i++) {
+      if (detector.process(raw[i] * kRawToFloat, event) && xQueueSend(eventQueue, &event, 0) != pdTRUE) {
+        droppedEvents = droppedEvents + 1;
+      }
     }
+    audioNowMs = detector.nowMs();
   }
 }
 
-void feedAllPatterns(unsigned long now) {
-  if ((long)(lockoutUntil - now) > 0) {
-    if (debugEnabled) DEBUG_PRINTLN(F("  tap ignored (post-action lockout)"));
+// ---------------------------------------------------------------------------
+// EVENT HANDLING (loop task)
+// ---------------------------------------------------------------------------
+void handleEvent(const tap::TapEvent& ev) {
+  tap::TapFeatures f;
+  tap::computeFeatures(ev.samples, f);
+  const char* reject = tap::checkFeatures(f, validatorConfig);
+  static bool hasLastTap = false;
+  static uint32_t lastTapMs = 0;
+  uint32_t sinceTap = hasLastTap ? ev.onsetMs - lastTapMs : UINT32_MAX;
+  if (!reject) reject = tap::checkContext(ev.preActivityDb, sinceTap, validatorConfig);
+
+  // Every event is logged, accepted or not, to refine thresholds later.
+  DEBUG_PRINTF("EVT t=%lu floor=%.1f peak=%.1f rise=%.2f decay=%.0f crest=%.1f pre=%.1f "
+               "band=%.2f excl=%.2f cent=%.0f flat=%.2f sim=%.2f act=%.1f -> %s\n",
+               (unsigned long)ev.onsetMs, ev.floorDb, f.peakDbfs, f.riseMs, f.decayMs, f.crestDb,
+               f.preContrastDb, f.bandRatio, f.exclusionRatio, f.centroidHz, f.flatness,
+               f.similarity, ev.preActivityDb, reject ? reject : "TAP");
+  if (!reject) {
+    hasLastTap = true;
+    lastTapMs = ev.onsetMs;
+    matcher.addTap(ev.onsetMs);
+  }
+}
+
+void handleSequence(const tap::SequenceResult& seq) {
+  if (!seq.match) {
+    DEBUG_PRINTF("SEQ %u taps, no match, gaps(ms):", seq.tapCount);
+    for (uint8_t i = 0; i + 1 < seq.tapCount && i < tap::kMaxTaps - 1; i++) {
+      DEBUG_PRINTF(" %lu", (unsigned long)seq.gapsMs[i]);
+    }
+    DEBUG_PRINTLN();
     return;
   }
-  for (uint8_t p = 0; p < PATTERN_COUNT; p++) {
-    TocPattern &pat = PATTERNS[p];
-    PatternState &st = patternStates[p];
 
-    // a tap arrived while waiting for the trailing silence: this wasn't a clean
-    // double tap (e.g. it's the 3rd tap of a triple), so cancel and restart on this tap
-    if (st.pending) {
-      if (debugEnabled) DEBUG_PRINTF("  [%s] cancelled (tap during confirmation silence)\n", pat.name);
-      st.pending = false;
-      st.step = 1;
-      st.lastMs = now;
-      continue;
-    }
-
-    if (st.step == 0) {
-      st.step = 1;
-      st.lastMs = now;
-      continue;
-    }
-
-    unsigned long gap = now - st.lastMs;
-    GapWindow expected = pat.gaps[st.step - 1];
-
-    if (gap >= expected.minMs && gap <= expected.maxMs) {
-      st.step++;
-      st.lastMs = now;
-      if (debugEnabled) {
-        DEBUG_PRINTF("  [%s] tap %d/%d (gap=%lums, expected %lu-%lums)\n",
-                     pat.name, st.step, pat.gapCount + 1, gap, expected.minMs, expected.maxMs);
-      }
-      if (st.step == pat.gapCount + 1) {
-        if (pat.trailingSilenceMs > 0) {
-          st.pending = true;
-          if (debugEnabled) DEBUG_PRINTF("  [%s] complete, waiting %lums of silence...\n", pat.name, pat.trailingSilenceMs);
-        } else {
-          onPatternRecognized(pat);
-          return; // state was reset; don't feed the remaining patterns with this tap
-        }
-      }
-    } else {
-      if (debugEnabled) {
-        const char* reason = (gap < expected.minMs) ? "too fast" : "too late";
-        DEBUG_PRINTF("  [%s] failed (%s, gap=%lums, expected %lu-%lums) -> restarting on this tap\n",
-                     pat.name, reason, gap, expected.minMs, expected.maxMs);
-      }
-      st.step = 1;
-      st.lastMs = now;
-    }
-  }
+  const uint8_t* action = kPatternActions[seq.match - kPatterns];
+  DEBUG_PRINTF("=== %s -> %s ===\n", seq.match->name, action == UNLOCK_CMD_DATA ? "UNLOCK" : "LOCK");
+  sendDoorFrame(action);
+  if (lastSendOk) ledSolidUntil = millis() + 1000;
+  else            ledErrorUntil = millis() + 2000;
 }
 
 // ---------------------------------------------------------------------------
 // SETUP / LOOP
 // ---------------------------------------------------------------------------
 void setup() {
-  Serial.begin(115200);
   pinMode(LED_PIN, OUTPUT);
   pinMode(MCP_INT_PIN, INPUT);
 #if RELAY_WAKE_ENABLED
   pinMode(RELAY_PIN, OUTPUT);
   relaySet(false); // start with the relay released ("door closed")
 #endif
+  Serial.begin(115200);
   delay(300);
   DEBUG_PRINTLN(F("=== PKE: double tap = unlock, triple tap = lock ==="));
 
   canReady = initCan();
+
+  eventQueue = xQueueCreate(kEventQueueLength, sizeof(tap::TapEvent));
   setupI2S();
+  // Core 0, high priority: Arduino loop() and its prints run on core 1.
+  xTaskCreatePinnedToCore(audioTask, "audio", 4096, nullptr, configMAX_PRIORITIES - 2, nullptr, 0);
 }
 
 void loop() {
-  size_t n = readBlock();
-  if (n == 0) return;
-
-  unsigned long now = millis();
+  static tap::TapEvent ev;  // too big for the loop stack
+  static uint32_t reportedDrops = 0;
 
   if (!canReady) handleNotReady();
   else           pollCanRx(); // track bus activity so we know if it's awake without transmitting
   updateLed();
-  checkPatternConfirmations(now);
 
-  float rms, peak;
-  computeRmsPeak(n, rms, peak);
-
-  if (ENVELOPE_DEBUG) {
-    Serial.printf("%.0f,%.0f\n", rms, peak);
+  if (xQueueReceive(eventQueue, &ev, pdMS_TO_TICKS(10)) == pdTRUE) {
+    handleEvent(ev);
   }
 
-  if (inImpact) {
-    // still decaying: wait for the level to drop below the release thresholds
-    if (rms < RMS_RELEASE_THRESHOLD && peak < PEAK_RELEASE_THRESHOLD) {
-      unsigned long duration = now - impactStartMs;
-      inImpact = false;
+  tap::SequenceResult seq;
+  if (matcher.poll(audioNowMs, seq)) handleSequence(seq);
 
-      if (tocPendingValidation) {
-        tocPendingValidation = false;
-        if (duration <= MAX_IMPACT_DURATION_MS) {
-          DEBUG_PRINTF(">>> TAP valid (duration=%lums) <<<\n", duration);
-          feedAllPatterns(impactStartMs); // keep the tap's original timestamp
-        } else {
-          DEBUG_PRINTF("  rejected: duration %lums > %lums\n", duration, MAX_IMPACT_DURATION_MS);
-        }
-      }
-    }
-    return;
-  }
-
-  bool candidate = (rms >= RMS_THRESHOLD) || (peak >= PEAK_THRESHOLD);
-  if (!candidate) return;
-
-  if ((now - lastTocMs) < MIN_REFRACTORY_MS) return;
-
-  float ratio, exclusionRatio;
-  computeSpectralRatios(n, ratio, exclusionRatio);
-
-  if (ratio >= SPECTRAL_MIN_RATIO && exclusionRatio <= EXCLUSION_MAX_RATIO) {
-    inImpact = true;
-    impactStartMs = now;
-    tocPendingValidation = true;
-    lastTocMs = now;
-    if (debugEnabled) {
-      DEBUG_PRINTF("  tap candidate (ratio=%.2f, exclusion=%.2f), waiting for duration check...\n",
-                   ratio, exclusionRatio);
-    }
+  if (droppedEvents != reportedDrops) {
+    reportedDrops = droppedEvents;
+    DEBUG_PRINTF("WARN %lu events dropped (queue full)\n", (unsigned long)reportedDrops);
   }
 }
