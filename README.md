@@ -100,6 +100,14 @@ A single wire at battery voltage: the body ECU holds one state through an intern
 
 Pulse a train, not once — Toyota's service procedure for a sleeping main body ECU is *open the driver door, then open and close a door several times at ~1.5 s intervals*.
 
+### Relay wake is integrated into the firmware
+
+The relay pulse is built into PKE itself (`RELAY_WAKE_ENABLED` in `config.h`, on by default). On an **unlock** gesture, if the bus reads as asleep, `sendDoorFrame()` calls `pulseRelayWake()`: it pulses `RELAY_PIN` (GPIO13) as a train of `RELAY_PULSE_COUNT` open/close cycles (`RELAY_PULSE_ON_MS` / `RELAY_PULSE_OFF_MS`, ~1.5 s each), draining RX throughout, and sends the door frame the moment the bus comes alive. Lock is unaffected — it fires in the responsive window, where the bus is already awake and this path isn't taken.
+
+Wire the relay **in parallel** with the driver's jamb switch, one contact on the switch line and one on a good chassis ground, with a common ground to the ESP32. Drive the coil through a transistor and a flyback diode (or use an opto-isolated relay module), contacts dry — switch the line, don't inject voltage into it. With no relay wired, GPIO13 just toggles harmlessly.
+
+**Validate on the car before relying on it** with the taped-plunger test, then the relay test — see [tests/reveil-ecu-relais.md](tests/reveil-ecu-relais.md).
+
 What is established, what isn't, and the test that closes the gap:
 
 - **A door opening does wake it**, with the car fob-locked, and **no alarm sounded** — so the theft deterrent, which reads this same switch, does not veto the approach. That was the risk that would have killed it.
