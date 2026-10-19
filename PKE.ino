@@ -213,6 +213,47 @@ bool awaitDoorReply(uint32_t windowMs) {
   return false;
 }
 
+// Waits up to ms while draining RX, returning early the moment the bus comes alive.
+bool dwellAndPoll(uint32_t ms) {
+  uint32_t until = millis() + ms;
+  while ((int32_t)(until - millis()) > 0) {
+    pollCanRx();
+    if (busLooksAwake()) return true;
+  }
+  return false;
+}
+
+#if RELAY_WAKE_ENABLED
+// Drives the relay level. With RELAY_ACTIVE_HIGH, energising the coil closes the relay and grounds
+// the jamb-switch line, which the body ECU reads as "driver's door open".
+void relaySet(bool energised) {
+  digitalWrite(RELAY_PIN, (energised == RELAY_ACTIVE_HIGH) ? HIGH : LOW);
+}
+
+// Wakes a body ECU in deep sleep by pulsing the relay across the driver's jamb switch as a train of
+// open/close cycles - the way Toyota's service procedure wakes a sleeping main body ECU (open the
+// door, then open and close several times at ~1.5 s intervals). A single pulse isn't enough. Keeps
+// draining RX throughout and returns as soon as the bus comes alive, so a wake short-circuits the
+// rest of the train.
+bool pulseRelayWake() {
+  DEBUG_PRINTLN(F("[wake] pulsing relay on the jamb-switch line..."));
+  for (uint8_t i = 0; i < RELAY_PULSE_COUNT; i++) {
+    relaySet(true);                              // "door open" - ground the line
+    bool awake = dwellAndPoll(RELAY_PULSE_ON_MS);
+    relaySet(false);                             // "door closed" - release to the pull-up
+    if (awake || dwellAndPoll(RELAY_PULSE_OFF_MS)) {
+      DEBUG_PRINTF("[wake] bus came alive after %u pulse(s)\n", i + 1);
+      return true;
+    }
+  }
+  // Train done: give the gateway/ECU a last moment to bring the bus up before giving up.
+  bool awake = dwellAndPoll(RELAY_WAKE_TIMEOUT_MS);
+  DEBUG_PRINTLN(awake ? F("[wake] bus came alive after the pulse train")
+                      : F("[wake] no traffic after relay pulses; ECU may still be asleep"));
+  return awake;
+}
+#endif
+
 // Sends the door command, retrying a few times.
 //
 // Retrying matters even when the bus reads silent: measured on the CT200h, a door frame sent after
@@ -237,8 +278,19 @@ void sendDoorFrame(const uint8_t* data) {
   // abort every later send too. So gate on bus state. The NM frame ticks ~1 Hz in the responsive
   // window, so busLooksAwake() stays true there and the quiet-stretch sends above still happen.
   if (!busLooksAwake()) {
+#if RELAY_WAKE_ENABLED
+    // Only unlock-on-return has to defeat deep sleep; lock happens in the responsive window just
+    // after walking away, where the bus is still awake and this branch isn't taken.
+    if (data == UNLOCK_CMD_DATA && pulseRelayWake()) {
+      DEBUG_PRINTLN(F("[door] bus woke after relay pulse, sending command"));
+    } else {
+      DEBUG_PRINTLN(F("[door] bus in deep sleep, command dropped (would fire on wake)"));
+      return;
+    }
+#else
     DEBUG_PRINTLN(F("[door] bus in deep sleep, command dropped (would fire on wake)"));
     return;
+#endif
   }
 
   for (uint8_t attempt = 1; attempt <= DOOR_MAX_RETRIES; attempt++) {
@@ -492,6 +544,10 @@ void setup() {
   Serial.begin(115200);
   pinMode(LED_PIN, OUTPUT);
   pinMode(MCP_INT_PIN, INPUT);
+#if RELAY_WAKE_ENABLED
+  pinMode(RELAY_PIN, OUTPUT);
+  relaySet(false); // start with the relay released ("door closed")
+#endif
   delay(300);
   DEBUG_PRINTLN(F("=== PKE: double tap = unlock, triple tap = lock ==="));
 

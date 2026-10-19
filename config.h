@@ -89,6 +89,24 @@ static const uint8_t TEC_REINIT_LIMIT = 128;
 // ---- GPIO ----
 static const uint8_t LED_PIN = 2;
 
+// ---- Relay wake (drives the driver's-door jamb-switch line to wake a sleeping body ECU) ----
+// In deep sleep (~10+ min idle) the body ECU no longer listens on CAN, so no frame can reach it
+// (measured: 16 wake frames, 0 ACKed). It wakes on its hardwired door-courtesy switches instead.
+// A relay wired in PARALLEL with the driver's jamb switch (Toyota 84231-60070) reproduces a door
+// opening: the ECU holds the line high via its internal pull-up (door closed), the switch grounds
+// it (door open), and closing the relay grounds it the same way. We pulse a train of open/close
+// cycles, as Toyota's service procedure for a sleeping main body ECU does, then send the door frame.
+//
+// Validate on the car with the taped-plunger test before relying on this (see tests/reveil-ecu-relais.md).
+// With no relay wired, RELAY_PIN just toggles an unconnected GPIO, which is harmless.
+#define RELAY_WAKE_ENABLED 1
+static const uint8_t RELAY_PIN = 13;         // GPIO driving the relay coil (via transistor + flyback diode)
+static const bool RELAY_ACTIVE_HIGH = true;  // energised coil closes the relay = jamb line grounded = "door open"
+static const uint8_t  RELAY_PULSE_COUNT     = 5;    // open/close cycles per wake attempt
+static const uint32_t RELAY_PULSE_ON_MS     = 1500; // "door open" dwell (relay energised)
+static const uint32_t RELAY_PULSE_OFF_MS    = 1500; // "door closed" dwell (relay released)
+static const uint32_t RELAY_WAKE_TIMEOUT_MS = 8000; // after the train, wait this long for the bus to come alive
+
 // ---- INMP441 I2S microphone ----
 #define I2S_WS_PIN   25
 #define I2S_SCK_PIN  33
