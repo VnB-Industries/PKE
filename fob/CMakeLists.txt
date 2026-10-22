@@ -16,6 +16,7 @@ project(pke_fob)
 
 target_sources(app PRIVATE
   src/main.c
+  src/motion.c
   ../common/pke_crypto.c
 )
 target_include_directories(app PRIVATE ../common)

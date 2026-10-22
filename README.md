@@ -11,7 +11,7 @@ The earlier ESP32 Arduino firmware (tap-only, no BLE) is on the `ESP32/main` bra
 | Directory | Contents |
 | --- | --- |
 | [car/](car/) | car unit: BLE central, CAN door frames, relay wake, tap listener |
-| [fob/](fob/) | fob: BLE peripheral with RPA, challenge-response |
+| [fob/](fob/) | fob: BLE peripheral with RPA, challenge-response, motion sleep |
 | [common/](common/) | GATT protocol ([pke_protocol.h](common/pke_protocol.h)) and PSA crypto on CryptoCell-310 ([pke_crypto.c](common/pke_crypto.c)) |
 | [scripts/](scripts/) | key generation and build/flash |
 | [tests/](tests/) | on-car test protocols |
@@ -26,10 +26,39 @@ The earlier ESP32 Arduino firmware (tap-only, no BLE) is on the `ESP32/main` bra
 | D3 | INMP441 SCK |
 | D4 | INMP441 WS |
 | D5 | INMP441 SD |
+| D6 | wake input, optional: push button to GND, and/or the driver's jamb-switch line through a diode (cathode to the line) |
+| D7 | SN65HVD230 Rs (standby control) |
 | D8 / D9 / D10 | MCP2515 SCK / MISO / MOSI |
 | 3V3 / GND | MCP2515 + SN65HVD230 module, INMP441 (L/R → GND) |
 
-The pins are set in [car/app.overlay](car/app.overlay). Set `osc-freq` there to match the crystal on your MCP2515 module (8 MHz by default). A wrong value still starts, but frames won't ACK. The CAN bitrate is 500 kbit/s. The fob needs only the XIAO; the UWB module is not fitted yet.
+The pins are set in [car/app.overlay](car/app.overlay). Set `osc-freq` there to match the crystal on your MCP2515 module (8 MHz by default). A wrong value still starts, but frames won't ACK. The CAN bitrate is 500 kbit/s. The UWB module is not fitted yet.
+
+## Hardware (fob)
+
+| Part | Role |
+| --- | --- |
+| Seeed XIAO nRF52840 (Plus) | BLE, crypto, and the onboard LiPo charger |
+| AFTERTECH 402030 LiPo (~190 mAh usable) | power, on the XIAO's BAT+ / BAT− pads, charged over USB-C |
+| ADXL362 accelerometer | motion switch: keeps the fob awake while it is carried, wakes it from System OFF |
+| UWB3000F00 (DW3000) | distance check; **not fitted yet** |
+
+| XIAO pin | Connects to |
+| --- | --- |
+| D1 | ADXL362 CS |
+| D2 | ADXL362 INT1 (wakes the nRF52840 from System OFF) |
+| D8 / D9 / D10 | ADXL362 SCLK / MISO / MOSI |
+| 3V3 / GND | ADXL362 VS and VIO |
+
+The pins are set in [fob/app.overlay](fob/app.overlay). The ADXL362 must stay powered from 3V3 when the fob is in System OFF: it is the only thing that can wake it. Leave INT1 on a pin with no pull-up or LED; the line idles low.
+
+The fob has two power states:
+
+- **Carried**: the fob advertises every ~250 ms and answers the car. The DW3000 will be powered only during a car session, for the 3–5 ranging rounds, and kept off otherwise.
+- **At rest**: after 5 minutes without movement, the fob stops advertising and enters System OFF. Only the ADXL362 (~270 nA) and the nRF52840's wake logic stay powered. The next movement wakes it, and it boots and advertises again.
+
+Details are under [Power](#power).
+
+When the UWB3000F00 is fitted, it shares the SPI bus (D8/D9/D10) and needs its own CS, IRQ and RST pins. Feed it from the regulated 3V3 pin, never from BAT+: a charged cell (~4.2 V) is above its 3.6 V maximum.
 
 No LEDs are used, to keep consumption down. Everything is reported on the USB serial log.
 
@@ -84,7 +113,31 @@ The MCP2515 sleeps outside a fob session, at a few µA, with no hardware change.
 
 That adds up to ~1.2 s to the first unlock of a session. At the end of the session, `door_sleep()` puts it back to sleep. While asleep it doesn't ACK, the same as an empty OBD port.
 
-The CAN transceiver module stays powered, and its draw depends on how its standby pin (Rs) is wired.
+The SN65HVD230 transceiver goes to standby with the MCP2515. D7 drives its Rs pin through a `can-transceiver-gpio` PHY in [car/app.overlay](car/app.overlay). `can_start()` drives Rs low (high-speed mode), and `can_stop()`, which `mcp_sleep()` calls, drives it high (standby). Standby draws ~370 µA instead of the ~10 mA of high-speed mode (datasheet values, to be measured). Its receiver stays on as a bus monitor, and no firmware code beyond the overlay is involved.
+
+Most SN65HVD230 modules tie Rs to GND on the board, either directly or through a resistor. Check yours before wiring D7:
+- **Tied directly to GND**: cut that link first. Otherwise, driving D7 high shorts the pin.
+- **Through a resistor**: remove it. If it stays, it draws 3.3 V / R from D7 for as long as the transceiver is in standby: 330 µA with 10 kΩ.
+
+Long parking is handled in three stages, counted from the end of the last fob session ([car/src/power.h](car/src/power.h)):
+
+| Time without a session | Car unit | Fob found |
+| --- | --- | --- |
+| under 2 days | normal scan, 50% radio duty | within ~1–2 s |
+| 2 to 4 days | deep idle: 1 s of scanning every 60 s (~1.7% duty) | within ~60 s |
+| over 4 days | System OFF: radio and CPU stopped | only after the wake input |
+
+In deep idle, hearing the fob at any RSSI returns the unit to normal scanning, and so does a press of the wake input. In System OFF, the wake input reboots the unit, which then scans normally. The idle clock restarts at every boot, so after a reflash or a replug the stages start from zero.
+
+The wake input is D6, active low with the internal pull-up. Two sources can share it:
+- A push button to GND, hidden somewhere reachable from inside the car.
+- The driver's jamb-switch line, through a diode with its cathode on the line (a Schottky such as a BAT54). Opening the door grounds the line, which pulls D6 low. When the door is closed, the diode blocks the line's battery voltage. After System OFF, the driver opens the car once with the original key, and PKE works again from the next approach.
+
+If D6 is left unconnected, the pull-up holds it inactive. The unit never wakes on its own, so after 4 days it stays off until it is unplugged and plugged back in. If the wake input fails to set up at boot, the unit logs an error and stops at deep idle instead.
+
+System OFF stops only the nRF52840. D7 keeps its level, so the transceiver stays in standby. The 12 V regulator's quiescent current and the transceiver's ~370 µA standby current set the unit's draw from then on.
+
+The fob sleeps when nobody carries it. The ADXL362 runs as a motion switch in wake-up mode (~270 nA), with INT1 high while the fob moves. After 5 minutes without an INT1 edge (`MOTION_IDLE_TIMEOUT_S` in [fob/src/motion.h](fob/src/motion.h)), the fob stops advertising and enters System OFF. It never sleeps during a car session or while INT1 is high. The next movement wakes it through INT1, and it reboots and starts advertising again. If the ADXL362 doesn't answer at boot, the fob logs an error and never sleeps, since nothing could wake it.
 
 Fob battery budget: chip sleep is a few µA, BLE bursts are a few mA, and UWB ranging (once fitted) averages ~21 mA with 72 mA peaks. Battery life therefore depends on keeping UWB asleep except for brief ranging bursts. A CR2032 needs a 100–470 µF buffer cap near the UWB module. A LiPo must feed the UWB module from the regulated 3.3 V pin: a charged cell (~4.2 V) is above the UWB3000F00's 3.6 V maximum.
 

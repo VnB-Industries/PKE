@@ -4,6 +4,9 @@
  *
  * Bluetooth callbacks only queue events; the crypto and the replies run in the
  * main thread, which owns all the state below.
+ *
+ * Five minutes without motion (motion.c) stops advertising and puts the fob in
+ * System OFF; the next movement wakes it, and it boots and advertises again.
  */
 #include <errno.h>
 #include <string.h>
@@ -16,6 +19,7 @@
 #include <zephyr/bluetooth/gatt.h>
 
 #include "keys.h"
+#include "motion.h"
 #include "pke_crypto.h"
 #include "pke_protocol.h"
 
@@ -46,6 +50,7 @@ enum fob_event {
 	FOB_EV_DISCONNECTED,
 	FOB_EV_RECYCLED,
 	FOB_EV_WRITE,
+	FOB_EV_IDLE,
 };
 
 struct fob_msg {
@@ -119,6 +124,11 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 static void recycled(void)
 {
 	post_event(FOB_EV_RECYCLED);
+}
+
+static void motion_idle(void)
+{
+	post_event(FOB_EV_IDLE);
 }
 
 static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
@@ -274,6 +284,10 @@ int main(void)
 	}
 	bt_addr_le_to_str(&id_addr, addr_str, sizeof(addr_str));
 	LOG_INF("fob ready, identity %s", addr_str);
+	err = motion_init(motion_idle);
+	if (err) {
+		LOG_ERR("motion sensor init failed (err %d), fob will never sleep", err);
+	}
 	advertise();
 
 	for (;;) {
@@ -307,6 +321,15 @@ int main(void)
 			break;
 		case FOB_EV_WRITE:
 			on_write(msg.data, msg.len);
+			break;
+		case FOB_EV_IDLE:
+			/* Never cut a live session, and a fob still moving isn't idle. */
+			if (cur_conn || motion_active()) {
+				motion_defer();
+				break;
+			}
+			bt_le_adv_stop();
+			motion_poweroff();
 			break;
 		}
 	}

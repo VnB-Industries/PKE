@@ -2,6 +2,8 @@
  * Car unit wiring on the XIAO nRF52840 (README "Hardware"):
  *   D0 relay coil driver    D1 MCP2515 CS    D2 MCP2515 INT
  *   D3 INMP441 SCK          D4 INMP441 WS    D5 INMP441 SD
+ *   D6 wake input (button or jamb-switch line through a diode, to GND)
+ *   D7 SN65HVD230 Rs (high = standby)
  *   D8/D9/D10 MCP2515 SCK/MISO/MOSI
  */
 
@@ -10,10 +12,25 @@
 		zephyr,canbus = &mcp2515;
 	};
 
+	/* can_start() drives Rs low (high speed), can_stop() high (standby, ~370 uA). */
+	can_phy: can-phy {
+		compatible = "can-transceiver-gpio";
+		max-bitrate = <1000000>;
+		standby-gpios = <&xiao_d 7 GPIO_ACTIVE_HIGH>;
+		#phy-cells = <0>;
+	};
+
 	zephyr,user {
 		/* Energised = relay closed = jamb-switch line grounded = "driver's door open". */
 		relay-gpios = <&xiao_d 0 GPIO_ACTIVE_HIGH>;
+		/* Low = wake: brings the unit back from deep idle or System OFF (power.c). */
+		wake-gpios = <&xiao_d 6 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 	};
+};
+
+/* D6/D7 are free for GPIO: the console is the USB serial port, not this UART. */
+&uart0 {
+	status = "disabled";
 };
 
 /* D4/D5 carry the I2S word select and data instead of I2C. */
@@ -32,6 +49,7 @@
 		/* Check the crystal printed on the module: a wrong value still starts, but frames won't ACK. */
 		osc-freq = <8000000>;
 		bitrate = <500000>;
+		phys = <&can_phy>;
 		status = "okay";
 	};
 };

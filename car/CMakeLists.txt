@@ -22,6 +22,7 @@ target_sources(app PRIVATE
   src/vehicle.c
   src/actions.c
   src/door.c
+  src/power.c
   src/tap_listener.cpp
   src/tap/detector.cpp
   src/tap/pattern.cpp

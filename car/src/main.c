@@ -20,6 +20,7 @@
 #include "car.h"
 #include "door.h"
 #include "pke_crypto.h"
+#include "power.h"
 #include "ranging.h"
 #include "rpa.h"
 #include "tap_listener.h"
@@ -47,6 +48,10 @@ LOG_MODULE_REGISTER(car, LOG_LEVEL_INF);
  * the boundary from flapping between lock and unlock.
  */
 #define RETRY_DELAY K_SECONDS(2)
+
+/* Deep idle (power.h): listen this long, once per period, for the fob. */
+#define BURST_MS       1000
+#define BURST_PERIOD_S 60
 
 struct adv_report {
 	bt_addr_le_t addr;
@@ -99,8 +104,11 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.security_changed = security_changed,
 };
 
-/* Step 2: scan until the fob's RPA resolves with a strong enough filtered RSSI. */
-static int wait_for_fob(bt_addr_le_t *fob)
+/*
+ * Step 2: scan until the fob's RPA resolves with a strong enough filtered RSSI.
+ * Returns -EAGAIN once timeout runs out first.
+ */
+static int scan_for_fob(bt_addr_le_t *fob, k_timeout_t timeout)
 {
 	/* No duplicate filtering: every advert feeds the RSSI filter. */
 	struct bt_le_scan_param param = {
@@ -109,6 +117,7 @@ static int wait_for_fob(bt_addr_le_t *fob)
 		.interval = BT_GAP_SCAN_FAST_INTERVAL,
 		.window = BT_GAP_SCAN_FAST_WINDOW,
 	};
+	k_timepoint_t end = sys_timepoint_calc(timeout);
 	char addr_str[BT_ADDR_LE_STR_LEN];
 	struct adv_report report;
 	int ema = 0;
@@ -125,7 +134,10 @@ static int wait_for_fob(bt_addr_le_t *fob)
 	LOG_INF("scanning for fob");
 
 	for (;;) {
-		k_msgq_get(&adv_q, &report, K_FOREVER);
+		if (k_msgq_get(&adv_q, &report, sys_timepoint_timeout(end))) {
+			err = -EAGAIN;
+			break;
+		}
 		if (!rpa_is_fob(&report.addr)) {
 			continue;
 		}
@@ -142,7 +154,70 @@ static int wait_for_fob(bt_addr_le_t *fob)
 	}
 
 	bt_le_scan_stop();
-	return 0;
+	return err;
+}
+
+/* Deep idle: one burst of continuous scanning. True if the fob was heard, at any RSSI. */
+static bool fob_heard_in_burst(void)
+{
+	struct bt_le_scan_param param = {
+		.type = BT_LE_SCAN_TYPE_PASSIVE,
+		.options = BT_LE_SCAN_OPT_NONE,
+		.interval = BT_GAP_SCAN_FAST_INTERVAL,
+		.window = BT_GAP_SCAN_FAST_INTERVAL,
+	};
+	k_timepoint_t end = sys_timepoint_calc(K_MSEC(BURST_MS));
+	struct adv_report report;
+	bool heard = false;
+
+	k_msgq_purge(&adv_q);
+	if (bt_le_scan_start(&param, scan_cb)) {
+		return false;
+	}
+	while (!heard && k_msgq_get(&adv_q, &report, sys_timepoint_timeout(end)) == 0) {
+		heard = rpa_is_fob(&report.addr);
+	}
+	bt_le_scan_stop();
+	return heard;
+}
+
+/*
+ * Step 2 with long-parking protection: scans normally until POWER_DEEP_IDLE,
+ * then in bursts, back to normal as soon as the fob is heard or the wake input
+ * is pressed, and enters System OFF at POWER_OFF.
+ */
+static int wait_for_fob(bt_addr_le_t *fob)
+{
+	enum power_stage stage, prev = POWER_NORMAL;
+	int err;
+
+	for (;;) {
+		stage = power_stage();
+		if (stage != prev) {
+			LOG_INF("power stage %d -> %d", prev, stage);
+			prev = stage;
+		}
+
+		switch (stage) {
+		case POWER_NORMAL:
+			err = scan_for_fob(fob, power_until_deep_idle());
+			if (err != -EAGAIN) {
+				return err;
+			}
+			break;
+		case POWER_DEEP_IDLE:
+			if (fob_heard_in_burst()) {
+				LOG_INF("fob heard, back to normal scanning");
+				power_note_activity();
+			} else {
+				power_wait_wake(K_MSEC(BURST_PERIOD_S * MSEC_PER_SEC - BURST_MS));
+			}
+			break;
+		case POWER_OFF:
+			power_off();
+			break;
+		}
+	}
 }
 
 /* Steps 2-3: connect and encrypt the link (LE Secure Connections, Just Works). */
@@ -344,6 +419,10 @@ int main(void)
 	/* Neither is fatal: BLE still runs, and door_send() retries the CAN start. */
 	door_init();
 	tap_listener_init();
+	err = power_init();
+	if (err) {
+		LOG_ERR("wake input init failed (err %d), System OFF disabled", err);
+	}
 
 	err = bt_enable(NULL);
 	if (err) {
@@ -359,6 +438,7 @@ int main(void)
 		}
 		run_session(&fob);
 		drop_conn();
+		power_note_activity();
 		k_sleep(RETRY_DELAY);
 	}
 }
