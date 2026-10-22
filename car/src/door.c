@@ -28,6 +28,9 @@ static const struct device *const can_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbu
 /* Raw access to the same chip, for the Sleep mode the Zephyr driver doesn't offer. */
 static const struct spi_dt_spec mcp_spi =
 	SPI_DT_SPEC_GET(DT_CHOSEN(zephyr_canbus), SPI_OP_MODE_MASTER | SPI_WORD_SET(8));
+#if BUS_WAKE_ENABLED
+static const struct gpio_dt_spec can_int = GPIO_DT_SPEC_GET(DT_CHOSEN(zephyr_canbus), int_gpios);
+#endif
 #if RELAY_WAKE_ENABLED
 static const struct gpio_dt_spec relay = GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), relay_gpios);
 #endif
@@ -139,7 +142,8 @@ static int mcp_read(uint8_t addr, uint8_t *value)
 /*
  * Puts the MCP2515 in Sleep mode, a few uA. can_stop() first aborts any pending frame and tells the
  * driver it is stopped. WAKIE stays off (the driver never sets it), so bus activity doesn't wake
- * the chip: only mcp_wake() does. Call with door_mutex held.
+ * the chip: only mcp_wake() does, or door_arm_bus_wake() just before System OFF. Call with
+ * door_mutex held.
  */
 static void mcp_sleep(void)
 {
@@ -354,3 +358,36 @@ void door_sleep(void)
 	}
 	k_mutex_unlock(&door_mutex);
 }
+
+#if BUS_WAKE_ENABLED
+int door_arm_bus_wake(void)
+{
+	int err;
+
+	k_mutex_lock(&door_mutex, K_FOREVER);
+	if (!mcp_asleep) {
+		mcp_sleep();
+	}
+	if (!mcp_asleep) {
+		err = -EIO;
+		goto out;
+	}
+	/*
+	 * Bus activity now wakes the chip, which sets WAKIF and pulls INT low. The driver resets the
+	 * MCP2515 at the next boot, which clears WAKIE and WAKIF again.
+	 */
+	err = mcp_bit_modify(MCP_ADDR_CANINTE, MCP_CANINTE_WAKIE, MCP_CANINTE_WAKIE);
+	if (!err) {
+		/* A level interrupt sets the pin's SENSE, which is what wakes the chip from System OFF. */
+		err = gpio_pin_interrupt_configure_dt(&can_int, GPIO_INT_LEVEL_ACTIVE);
+	}
+out:
+	k_mutex_unlock(&door_mutex);
+	return err;
+}
+#else
+int door_arm_bus_wake(void)
+{
+	return -ENOTSUP;
+}
+#endif
