@@ -1,28 +1,57 @@
 # PKE
 
-Full Passive Entry System
+Passive Entry System for a 2018 Lexus CT200h. The car unit runs on an **ESP32 DevKit** (Arduino core, PlatformIO). The fob is a Seeed XIAO nRF52840 (Plus) running the fob firmware from the `nrf52840/main` branch.
 
-## Tap-to-lock/unlock firmware (PKE.ino)
+- **Fob**: advertises with a rotating Resolvable Private Address (RPA). Its firmware is unchanged from `nrf52840/main`.
+- **Car unit**: scans for the fob and resolves its RPA with the enrolled IRK. When the fob is close, the car unlocks the doors over CAN (MCP2515 on the OBD port), and it locks them when the fob walks away. It wakes a body ECU in deep sleep by pulsing a relay on the driver's door jamb switch.
+- **Window taps** (INMP441 mic on the glass, car unit) give manual control: double tap = unlock, triple tap = lock. **The mic only runs while the fob is detected**, so a tap on its own can never open the car.
 
-ESP32 firmware that unlocks the car on a **double tap** and locks it on a **triple tap**, detected by an INMP441 microphone on the window and sent over CAN through an MCP2515.
+This is a port of the `nrf52840/main` car unit with **simplified authentication**. The car never connects to the fob: a resolved RPA with a strong enough signal is enough to unlock. There is no challenge-response, no session key and no UWB step. Read [Safety](#safety) before relying on it.
 
-Combines [../tapDetector](../tapDetector) (tap detection) and [../obd-tool](../obd-tool) (CAN door frames).
+| Directory | Contents |
+| --- | --- |
+| [car/](car/) | car unit: BLE scanner, RPA resolution, CAN door frames, relay wake, tap listener |
+| [common/](common/) | `keys.h`, generated and gitignored, shared with the fob build |
+| [scripts/](scripts/) | key generation and build/flash |
+| [tests/](tests/) | on-car test protocols |
 
-The tap detector sources in `src/` are a copy of [../tapDetector/src](../tapDetector/src): onset detector in an audio task on core 0, temporal and FFT validation of each event, then timing pattern matching. After retuning thresholds or rebuilding the template there, copy `src/` over again.
+## Hardware (car unit)
 
-## Hardware
+| ESP32 GPIO | Connects to |
+| --- | --- |
+| 13 | relay coil driver (transistor + flyback diode, or opto-isolated module) |
+| 5 | MCP2515 CS |
+| 4 | MCP2515 INT (required: received frames wake the CAN task) |
+| 18 / 19 / 23 | MCP2515 SCK / MISO / MOSI (VSPI) |
+| 33 | INMP441 SCK |
+| 25 | INMP441 WS |
+| 32 | INMP441 SD |
+| 3V3 / GND | MCP2515 + SN65HVD230 module, INMP441 (L/R → GND) |
 
-- ESP32 DevKit
-- INMP441 I2S microphone: VDD→3.3V, GND→GND, L/R→GND, WS→GPIO25, SCK→GPIO33, SD→GPIO32
-- MCP2515 + SN65HVD230 CAN module: see the wiring table in [../obd-tool/README.md](../obd-tool/README.md) (CS→GPIO5, INT→GPIO4, SCK/MISO/MOSI→18/19/23, VCC→3.3V)
+The pins are set in [car/src/board.h](car/src/board.h). Set `MCP_OSC_FREQ` in [car/src/door_config.h](car/src/door_config.h) to match the crystal on your MCP2515 module (8 MHz by default). A wrong value still starts, but frames won't ACK. The CAN bitrate is 500 kbit/s.
 
-No pin conflicts between the two.
+No LEDs are used. Everything is reported on the USB serial log.
 
-## Build
+## Build & flash
 
-Arduino IDE with the ESP32 core, plus library `MCP_CAN_lib` (coryjfowler). Set `MCP_OSC_FREQ` in `config.h` to match your module's crystal. Serial monitor at 115200.
+1. Use the same `common/keys.h` as the fob. `keys.h` is gitignored, so a copy generated on `nrf52840/main` stays in place when you switch branches. To start from scratch, run `python3 scripts/gen_keys.py`, then flash the fob from `nrf52840/main` with the new file. The car only uses the fob IRK from it.
+2. Build, flash and open the log:
+   ```sh
+   scripts/flash.sh              # add -p for a pristine build, or a port: scripts/flash.sh /dev/ttyUSB0
+   ```
+   This runs `pio run -d car -t upload -t monitor`. It uses `pio` from the PATH, or the copy installed by the PlatformIO IDE extension. PlatformIO fetches NimBLE-Arduino and mcp_can (coryjfowler) on the first build.
+3. The log is on the DevKit's USB serial port, at 115200 baud.
 
-## Behaviour
+## How it works
+
+1. **Enrollment**: `scripts/gen_keys.py` creates the fob IRK and its static identity address (plus the shared secret, which only the nRF car firmware uses). The fob is built with them; the car only needs the IRK.
+2. **Detection and unlock**: the fob's RPA rotates every 60 s (`CONFIG_BT_RPA_TIMEOUT` in the fob build, short for testing). The car scans passively and continuously, and resolves each RPA advert on the host with AES-128 (ESP32 hardware AES through mbedTLS). Once the filtered advert RSSI holds -70 dBm for 3 adverts, it starts the tap listener and sends the unlock frame ([door.cpp](car/src/door.cpp)), with the relay wake if the bus is asleep. The session stays up even if delivery failed; a double tap retries it.
+3. **Exit detection**: the car keeps following the fob's adverts. An exit starts when the filtered RSSI stays below -80 dBm for 5 adverts, or when no advert arrives for 3 s. The vehicle precondition ([vehicle.cpp](car/src/vehicle.cpp)) is a stub that always returns true.
+4. **Lock**: on an exit the car sends the lock frame. If the lock failed and the fob is still heard, it waits for the next exit trigger; if the fob is gone, the session ends anyway. The tap listener stops, the MCP2515 goes back to Sleep, and the car searches again after 2 s. The 10 dB gap between the detect and exit thresholds stops it from flapping.
+
+BLE thresholds are `#define`s at the top of [car/src/main.cpp](car/src/main.cpp). Door frames, retries and relay timings are in [car/src/door_config.h](car/src/door_config.h).
+
+### Tap gestures (fob detected only)
 
 | Gesture | Action |
 | --- | --- |
@@ -31,7 +60,23 @@ Arduino IDE with the ESP32 core, plus library `MCP_CAN_lib` (coryjfowler). Set `
 
 A gesture is only matched after 1.2 s of silence following its last tap. That is what lets a third tap turn an unlock into a lock, and it makes a fourth tap cancel the gesture. The cost is a 1.2 s delay before either command.
 
-LED: fast blink = CAN not ready, slow blink = on-bus, solid 1 s = command acknowledged, 2 s stutter = command not delivered.
+The detector in [car/src/tap/](car/src/tap/) is a copy of [../tapDetector/src](../tapDetector/src): an onset detector on every sample, temporal and FFT validation of each event, then timing pattern matching. [tap_listener.cpp](car/src/tap_listener.cpp) runs it in two tasks: capture on core 0, processing on core 1. Between sessions the I2S peripheral is stopped and both tasks block, so the mic is unclocked and draws nothing.
+
+### Power
+
+The ESP32 scans continuously, so the car unit draws on the order of 100 mA all the time. That is far more than the nRF52840 version, and it matters on a parked car's 12 V auxiliary battery. Budget for it, or power the unit from a switched supply.
+
+What is kept from the nRF version: there are no LEDs, the I2S clock runs only while the fob is detected, and the relay dwell blocks on a semaphore instead of polling.
+
+The MCP2515 sleeps outside a fob session, at a few µA. `setMode(MCP_SLEEP)` from mcp_can sets REQOP in CANCTRL to Sleep (`0x20`). WAKIE stays off, so bus traffic can't wake it. The first `door_send()` of a session wakes it with `setMode(MCP_NORMAL)`:
+1. mcp_can sets WAKIF in CANINTF.
+2. The chip restarts its crystal and comes up in Listen-Only mode.
+3. mcp_can switches it to normal mode.
+4. The firmware listens for up to 1.2 s, so the bus-awake check sees the bus as it is now.
+
+That adds up to ~1.2 s to the first unlock of a session. At the end of the session, `door_sleep()` puts it back to sleep. While asleep it doesn't ACK, the same as an empty OBD port.
+
+The CAN transceiver module stays powered, and its draw depends on how its standby pin (Rs) is wired.
 
 ## Waking a sleeping bus
 
@@ -49,15 +94,15 @@ There is no secret wake frame. Per ISO 11898-2 a transceiver leaves standby on a
 
 `REC=0` means not one bit ever came back, and no amount of bus activity changed that. The reason is that **a Toyota main body ECU wakes on its hardwired inputs — the door courtesy switches — not on CAN activity.** Toyota's own service procedure for a sleeping main body ECU is physical: with the engine switch off, open the driver door, then open and close a door several times at ~1.5 s intervals. Bus wake-up is a feature of partial-networking transceivers on newer platforms; this one doesn't have it.
 
-So `WAKE_BUS_ENABLED` defaults to `0`. The code is kept for platforms where it does work.
+So the CAN wake is not in this firmware. The earlier tap-only sketch with `WAKE_BUS_ENABLED` (`PKE.ino`) is in this branch's history, for platforms where it does work.
 
 ### What the error flags mean
 
-`EFLG=0x15` is EWARN + TXWAR + TXEP: error-passive, **not** bus-off (that would be bit 5, `0x20`). `TEC` pins at exactly 128 and never climbs, because an error-passive transmitter that sees no dominant bit during its passive error flag doesn't increment TEC. The MCP2515 therefore can't reach the 256 bus-off limit this way — the earlier worry about bus-off was unfounded, and `TEC_REINIT_LIMIT` is 128 so the reset still fires and clears the state for the next gesture.
+`EFLG=0x15` is EWARN + TXWAR + TXEP: error-passive, **not** bus-off (that would be bit 5, `0x20`). `TEC` pins at exactly 128 and never climbs, because an error-passive transmitter that sees no dominant bit during its passive error flag doesn't increment TEC. The MCP2515 therefore can't reach the 256 bus-off limit this way — the earlier worry about bus-off was unfounded. A door frame that mcp_can can't get ACKed within its 2.5 ms send timeout is dropped by resetting the MCP2515, so it can't stay queued and fire later when the ECU wakes.
 
 ### Current behaviour
 
-The firmware polls RX continuously, so it knows whether the bus is alive without transmitting. On a gesture it tries the door frame, and if nothing answers it stops rather than retrying into a dead bus. The log distinguishes a silent bus from a frame refused on an active bus (which would point at bitrate or wiring instead). The LED goes solid 1 s when a command was acknowledged and stutters for 2 s when it wasn't, so a failure is visible from outside the car.
+The firmware receives every frame (a task woken by the MCP2515 INT pin, no polling), so it knows whether the bus is alive without transmitting. On a gesture it tries the door frame, and if nothing answers it stops rather than retrying into a dead bus. The log distinguishes a silent bus from a frame refused on an active bus (which would point at bitrate or wiring instead).
 
 An ACK only proves *some* node is awake, not the body ECU specifically, so a successful send still doesn't guarantee the doors moved.
 
@@ -68,7 +113,7 @@ The earlier conclusion here — that a sleeping car can't be driven from the OBD
 1. **Acknowledging matters.** The gateway is the only other node on the diagnostic segment. If this node doesn't ACK its ~1 Hz NM frame, the gateway retransmits at ~1400 frames/s and the wake aborts. So the firmware must run the MCP2515 in normal mode and keep draining RX — which it does.
 2. **A quiet bus is not necessarily a sleeping one.** A door frame sent after **42 s of silence**, with no fob press, was ACKed *and* positively answered by the body ECU. As long as this node stays present and ACKs, those quiet stretches look like gaps in the NM cycle rather than deep sleep.
 
-So `sendDoorFrame()` now always attempts the send, retries `DOOR_MAX_RETRIES` times with `DOOR_RETRY_GAP_MS` between attempts, and never gives up on the first failure. The previous version bailed out immediately whenever `WAKE_BUS_ENABLED` was off, which meant it only ever tried once.
+So `door_send()` now always attempts the send, retries `DOOR_MAX_RETRIES` times with `DOOR_RETRY_GAP_MS` between attempts, and never gives up on the first failure.
 
 It also waits briefly for the reply on `0x758` and logs `body ECU confirmed` when byte 2 is `0x70` — the positive response to service `0x30`. That is real confirmation the doors were commanded, unlike an ACK, which only says some node heard the frame.
 
@@ -104,7 +149,7 @@ Pulse a train, not once — Toyota's service procedure for a sleeping main body 
 
 ### Relay wake is integrated into the firmware
 
-The relay pulse is built into PKE itself (`RELAY_WAKE_ENABLED` in `config.h`, on by default). On an **unlock** gesture, if the bus reads as asleep, `sendDoorFrame()` calls `pulseRelayWake()`: it pulses `RELAY_PIN` (GPIO13) as a train of `RELAY_PULSE_COUNT` open/close cycles (`RELAY_PULSE_ON_MS` / `RELAY_PULSE_OFF_MS`, ~1.5 s each), draining RX throughout, and sends the door frame the moment the bus comes alive. Lock is unaffected — it fires in the responsive window, where the bus is already awake and this path isn't taken.
+The relay pulse is built into PKE itself (`RELAY_WAKE_ENABLED` in [car/src/door_config.h](car/src/door_config.h), on by default). On an **unlock** (fob detected or double tap), if the bus reads as asleep, `door_send()` calls `relay_wake()`: it pulses the relay output (GPIO13) as a train of `RELAY_PULSE_COUNT` open/close cycles (`RELAY_PULSE_ON_MS` / `RELAY_PULSE_OFF_MS`, ~1.5 s each), watching CAN RX throughout, and sends the door frame the moment the bus comes alive. Lock is unaffected — it fires in the responsive window, where the bus is already awake and this path isn't taken.
 
 Wire the relay **in parallel** with the driver's jamb switch, one contact on the switch line and one on a good chassis ground, with a common ground to the ESP32. Drive the coil through a transistor and a flyback diode (or use an opto-isolated relay module), contacts dry — switch the line, don't inject voltage into it. With no relay wired, GPIO13 just toggles harmlessly.
 
@@ -118,10 +163,18 @@ What is established, what isn't, and the test that closes the gap:
 
 A keepalive remains theoretically possible — injecting NM frames *during* the responsive window to extend it — but it cannot help after deep sleep, `0x45A` collides with the real gateway while it is awake, and holding the network up drains a 45 Ah hybrid aux battery. Not recommended.
 
+
 ## Calibration
 
-Thresholds live in `src/tap_config.h` and the spectral template in `src/tap_template.h`. Both depend on the mic gain and the car window. Every detected event is logged as an `EVT` line with its features and the reason it was rejected, if any. Tune from recordings following [../tapDetector/TAP_TRAINING_PROCESS.md](../tapDetector/TAP_TRAINING_PROCESS.md), then copy the updated `src/` here.
+Thresholds live in [car/src/tap/tap_config.h](car/src/tap/tap_config.h) and the spectral template in [car/src/tap/tap_template.h](car/src/tap/tap_template.h). They were tuned on the ESP32 with this sample scaling (32-bit I2S words, `kRawToFloat` in [tap_listener.cpp](car/src/tap_listener.cpp)), and they depend on the mic gain and the car window. Every detected event is logged as an `EVT` line with its features and the reason it was rejected, if any. Tune from recordings following [../tapDetector/TAP_TRAINING_PROCESS.md](../tapDetector/TAP_TRAINING_PROCESS.md), then copy the updated sources here.
 
 ## Safety
 
-Anyone who can tap your window can unlock the car. Use only while parked, and verify the CAN frames before using this on a vehicle other than the 2018 Lexus CT200h.
+**This firmware trades security for simplicity.** The car unlocks on any advert whose address resolves with the fob IRK. Nothing proves that the fob is the one sending it, or that it is actually near the car:
+
+- **Replay**: anyone who records one of the fob's adverts can replay it to unlock the car, for as long as that RPA is still current (60 s with the test setting of `CONFIG_BT_RPA_TIMEOUT`, 15 min with Zephyr's default).
+- **Relay**: a pair of radios that forwards the fob's adverts from your pocket to the car unlocks it at any distance, with no time limit.
+
+The `nrf52840/main` car firmware stops replay with an HMAC challenge-response over an encrypted link. Stopping a relay attack needs the planned UWB distance check on either firmware.
+
+A tap only acts while the fob is detected. The CAN frames are verified only on the 2018 Lexus CT200h; check them before using this on another vehicle.
