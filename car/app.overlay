@@ -1,0 +1,63 @@
+/*
+ * Car unit wiring on the XIAO nRF52840 (README "Hardware"):
+ *   D0 relay coil driver    D1 MCP2515 CS    D2 MCP2515 INT
+ *   D3 INMP441 SCK          D4 INMP441 WS    D5 INMP441 SD
+ *   D8/D9/D10 MCP2515 SCK/MISO/MOSI
+ */
+
+/ {
+	chosen {
+		zephyr,canbus = &mcp2515;
+	};
+
+	zephyr,user {
+		/* Energised = relay closed = jamb-switch line grounded = "driver's door open". */
+		relay-gpios = <&xiao_d 0 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/* D4/D5 carry the I2S word select and data instead of I2C. */
+&i2c1 {
+	status = "disabled";
+};
+
+&xiao_spi {
+	cs-gpios = <&xiao_d 1 GPIO_ACTIVE_LOW>;
+
+	mcp2515: can@0 {
+		compatible = "microchip,mcp2515";
+		reg = <0>;
+		spi-max-frequency = <1000000>;
+		int-gpios = <&xiao_d 2 GPIO_ACTIVE_LOW>;
+		/* Check the crystal printed on the module: a wrong value still starts, but frames won't ACK. */
+		osc-freq = <8000000>;
+		bitrate = <500000>;
+		status = "okay";
+	};
+};
+
+&pinctrl {
+	i2s0_default: i2s0_default {
+		group1 {
+			psels = <NRF_PSEL(I2S_SCK_M, 0, 29)>,
+				<NRF_PSEL(I2S_LRCK_M, 0, 4)>,
+				<NRF_PSEL(I2S_SDIN, 0, 5)>;
+		};
+	};
+
+	i2s0_sleep: i2s0_sleep {
+		group1 {
+			psels = <NRF_PSEL(I2S_SCK_M, 0, 29)>,
+				<NRF_PSEL(I2S_LRCK_M, 0, 4)>,
+				<NRF_PSEL(I2S_SDIN, 0, 5)>;
+			low-power-enable;
+		};
+	};
+};
+
+&i2s0 {
+	status = "okay";
+	pinctrl-0 = <&i2s0_default>;
+	pinctrl-1 = <&i2s0_sleep>;
+	pinctrl-names = "default", "sleep";
+};

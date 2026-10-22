@@ -34,7 +34,7 @@ Le **Test A** ci-dessous lève cette ambiguïté **sans aucun accès électrique
 - Logger CAN : montage **odb-tool** (ESP32 + MCP2515 + SN65HVD230) branché OBD-II broches 6/14 (CAN-H/CAN-L) + masse 4/5. Crystal du MCP2515 bien réglé dans `config.h` (`MCP_OSC_FREQ`).
 - Serial Monitor à 115200 baud, Newline.
 - Du ruban adhésif résistant (pour le Test A).
-- Pour le Test B : un relais (bobine 5 V pilotée par GPIO via transistor + diode de roue libre, ou module relais opto-isolé), contacts **en parallèle** du contacteur de montant.
+- Pour le Test B : un relais (bobine 5 V pilotée par GPIO via transistor + diode de roue libre, ou module relais opto-isolé), contacts **en parallèle** du contacteur de montant. Avec le firmware PKE (XIAO nRF52840), la commande du relais sort sur **D0** (`relay-gpios` dans `car/app.overlay`).
 
 ---
 
