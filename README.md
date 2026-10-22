@@ -18,27 +18,36 @@ The car unit is also ported to an ESP32 DevKit on the `ESP32/main` branch, with 
 
 ## Hardware (car unit)
 
-| XIAO pin | Connects to |
-| --- | --- |
-| D0 | relay coil driver (transistor + flyback diode, or opto-isolated module) |
-| D1 | MCP2515 CS |
-| D2 | MCP2515 INT (required by the Zephyr driver) |
-| D3 | INMP441 SCK |
-| D4 | INMP441 WS |
-| D5 | INMP441 SD |
-| D6 | wake input, optional: push button to GND, and/or the driver's jamb-switch line through a diode (cathode to the line) |
-| D7 | SN65HVD230 Rs (standby control) |
-| D8 / D9 / D10 | MCP2515 SCK / MISO / MOSI |
-| 3V3 / GND | INMP441 (L/R → GND). GND also goes to the MCP2515 module. The module needs its own 3.3 V supply: see below. |
+This branch (`nrf52840/UWB`) targets the car unit on the **carte_uwb support board**: the XIAO nRF52840 Plus and the UWB3000F00 (DW3000) soldered on one PCB inside a dashboard button cap. The board's design files are kept in the project files (`boitiers/3-voiture-legere-boutons-micro-nrf/carte_uwb/`), not in this repository. **The pinout below is the board's and must always match it**: the board routes without crossings, so any change here needs a board revision. `nrf52840/main` keeps the earlier hand-wired pinout, without UWB.
 
-The pins are set in [car/app.overlay](car/app.overlay). Set `osc-freq` there to match the crystal on your MCP2515 module (8 MHz by default). A wrong value still starts, but frames won't ACK. The CAN bitrate is 500 kbit/s. The UWB module is not fitted yet.
+| XIAO pin | nRF52840 | Connects to | Board |
+| --- | --- | --- | --- |
+| D0 | P0.02 | DW3000 SCK (SPIM3) | on board |
+| D1 | P0.03 | DW3000 RSTn (open drain, never driven high) | on board |
+| D2 | P0.28 | DW3000 WAKEUP | on board |
+| D3 | P0.29 | DW3000 MOSI | on board |
+| D4 | P0.04 | DW3000 MISO | on board |
+| D5 | P0.05 | DW3000 CS | on board |
+| D6 | P1.11 | DW3000 IRQ (active high, internal pull-down) | on board |
+| D7 | P1.12 | SN65HVD230 Rs (standby control) | J1 pin 9 |
+| D8 | P1.13 | MCP2515 CS | J1 pin 7 |
+| D9 | P1.14 | MCP2515 INT (required by the Zephyr driver) | J1 pin 5 |
+| D10 | P1.15 | relay coil driver | J1 pin 3 |
+| D11 / D12 / D13 (bottom pads) | P0.15 / P0.19 / P1.01 | INMP441 SD / SCK / WS (L/R → GND) | J2 pins 3 / 2 / 1 |
+| D14 (bottom pad) | P0.09 | wake input, optional: push button to GND, and/or the driver's jamb-switch line through a diode (cathode to the line) | J1 pin 11 |
+| D17 / D18 / D19 (bottom pads) | P1.03 / P1.05 / P1.07 | MCP2515 SCK / MISO / MOSI (SPIM2) | J1 pins 8 / 6 / 4 |
+| 3V3 / GND | | from the OBD box's 3.3 V converter | J1 pins 1 / 2, 10 |
+
+The pins are set in [car/app.overlay](car/app.overlay). The UWB and the CAN each have their own SPI bus, so a CAN transfer never delays a ranging exchange. P0.09 and P0.10 are NFC pins by default: the overlay sets `nfct-pins-as-gpios` in the UICR. Leave D15 (P0.10) unconnected, since the two NFC pads leak into each other when held at different levels. The DW3000 node is `disabled` and uses a local binding ([car/dts/bindings/qorvo,dw3000.yaml](car/dts/bindings/qorvo,dw3000.yaml)) until the Qorvo driver is brought in.
+
+Set `osc-freq` in the overlay to match the crystal on your MCP2515 module (8 MHz by default). A wrong value still starts, but frames won't ACK. The CAN bitrate is 500 kbit/s.
 
 **Important notes before assembly:**
 
 - **Don't power the CAN module from the XIAO's 3V3 pin**: the XIAO's regulator holds 3.3 V at rest, but it can't deliver the SN65HVD230's current bursts when it transmits. Measured on the car: from the XIAO's 3V3, every transmitted frame failed with bit errors (`TXB0CTRL 18`) and the MCP2515 went bus-off, while receiving still worked. The same module powered from another 3.3 V supply transmitted fine with the same XIAO and firmware. The weak supply also left the MCP2515 unconfigured at boot (`CNF 00 00 00`, `CANINTE 00`), which the firmware now detects and repairs (`mcp_restore_config()` in [car/src/door.c](car/src/door.c)). Feed the module from its own 3.3 V regulator (e.g. an MCP1700 or AMS1117-3.3), with its GND tied to the XIAO's GND, and put 47–100 µF plus 100 nF across VCC/GND at the module.
 - **The MOSI line back-powers the module**: with the module's VCC disconnected, its PWR LED still lights, fed from MOSI through the MCP2515's input protection diode. Don't run it that way: check that VCC is really connected.
 - **D7 to Rs**: most SN65HVD230 modules tie Rs to GND. Cut that link, or remove the resistor, before connecting D7. Otherwise, driving D7 high shorts the pin. Details are under [Power](#power).
-- **No UWB on this wiring**: D0–D10 are all taken. UWB will come with a dedicated carrier PCB for the XIAO and the UWB3000F00 module, which has its own pinout, so the overlay will change then. Until that board is made, don't wire a DW3000 to this unit.
+- **The SPI to the MCP2515 runs down the J1 cable** to the OBD box, at 8 MHz. Keep the cable short; if frames come back corrupt, lower `spi-max-frequency` in [car/app.overlay](car/app.overlay).
 
 ## Hardware (fob)
 
@@ -51,10 +60,14 @@ The pins are set in [car/app.overlay](car/app.overlay). Set `osc-freq` there to 
 
 | XIAO pin | Connects to |
 | --- | --- |
+| D0 | DW3000 CS (UWB, not fitted yet) |
 | D1 | ADXL362 CS |
 | D2 | ADXL362 INT1 (wakes the nRF52840 from System OFF) |
-| D8 / D9 / D10 | ADXL362 SCLK / MISO / MOSI |
-| 3V3 / GND | ADXL362 VS and VIO |
+| D3 | DW3000 IRQ (active high, internal pull-down) |
+| D4 | DW3000 RSTn (open drain: pulled low to reset, never driven high) |
+| D5 | DW3000 WAKEUP (optional) |
+| D8 / D9 / D10 | SCLK / MISO / MOSI, shared by the ADXL362 and the DW3000 |
+| 3V3 / GND | ADXL362 VS and VIO, UWB3000F00 |
 
 The XIAO also wires its charger to internal pins, which the firmware reads (from Seeed's schematic, not the Zephyr board files):
 
@@ -68,12 +81,17 @@ The pins are set in [fob/app.overlay](fob/app.overlay). The ADXL362 must stay po
 
 The fob has two power states:
 
-- **Carried**: the fob advertises every ~250 ms and answers the car. The DW3000 will be powered only during a car session, for the 3–5 ranging rounds, and kept off otherwise.
+- **Carried**: the fob advertises every ~250 ms and answers the car. The DW3000 will be awake only during a car session, for the 3–5 ranging rounds, and in DEEPSLEEP otherwise.
 - **At rest**: after 1 minute without movement, the fob stops advertising and enters System OFF. Only the ADXL362 (~270 nA) and the nRF52840's wake logic stay powered. The next movement wakes it, and it boots and advertises again. With a car connected, the fob waits twice as long at rest, then closes the link itself before powering off.
 
 Details are under [Power](#power).
 
-When the UWB3000F00 is fitted, it shares the SPI bus (D8/D9/D10) and needs its own CS, IRQ and RST pins. Feed it from the regulated 3V3 pin, never from BAT+: a charged cell (~4.2 V) is above its 3.6 V maximum.
+When the UWB3000F00 is fitted, it shares the SPI bus (D8/D9/D10) with the ADXL362, with its own CS on D0. The ADXL362 keeps D1 and D2, which the earlier pin plan gave to the UWB: moving it would mean rewiring for nothing, and putting either chip on SPI1 (D17–D19) would mean soldering under the XIAO, so it could no longer lie flat on the battery. Sharing works because:
+- The DW3000 releases MISO whenever its CS is high (datasheet §4.9.1: "SPIMISO … go open-drain when SPICSn is de-asserted, to allow interoperation with other slaves"), and so does the ADXL362.
+- Both default to SPI mode 0, and each node has its own `spi-max-frequency` (ADXL362 1 MHz, DW3000 up to 38 MHz), which Zephyr applies per transaction.
+- The SPI driver drives every `cs-gpios` line inactive at boot, so D0 keeps the DW3000 deselected even before its driver exists, and the level holds in System OFF.
+
+The DW3000 node in the overlay is `disabled` and uses a local binding ([fob/dts/bindings/qorvo,dw3000.yaml](fob/dts/bindings/qorvo,dw3000.yaml)) until the Qorvo driver is brought in. Before System OFF, the UWB code will have to put the DW3000 in DEEPSLEEP (~260 nA) with its IRQ in active-high mode, and keep it powered: an unpowered DW3000 on a shared bus would be back-fed through its I/O pins whenever the ADXL362 is read. Feed it from the regulated 3V3 pin, never from BAT+: a charged cell (~4.2 V) is above its 3.6 V maximum.
 
 The onboard RGB LED is used only at boot: a ~0.7 s red-green-blue chase then a white flash ([common/boot_led.c](common/boot_led.c)), on both boards. Each wake from System OFF is a reboot, so it also marks every wake. The LED stays off otherwise, to keep consumption down. Everything else is reported on the USB serial log.
 
@@ -144,15 +162,21 @@ Long parking is handled in three stages, counted from the end of the last fob se
 | 2 to 4 days | deep idle: 1 s of scanning every 60 s (~1.7% duty) | within ~60 s |
 | over 4 days | System OFF: radio and CPU stopped | only after the wake input |
 
-In deep idle, hearing the fob at any RSSI returns the unit to normal scanning, and so does a press of the wake input. In System OFF, the wake input reboots the unit, which then scans normally. The idle clock restarts at every boot, so after a reflash or a replug the stages start from zero.
+In deep idle, hearing the fob at any RSSI returns the unit to normal scanning, and so does a press of the wake input. In System OFF, the wake input or CAN bus activity reboots the unit, which then scans normally. The idle clock restarts at every boot, so after a reflash or a replug the stages start from zero.
 
-The wake input is D6, active low with the internal pull-up. Two sources can share it:
+The wake input is D14 (P0.09, J1 pin 11), active low with the internal pull-up. Two sources can share it:
 - A push button to GND, hidden somewhere reachable from inside the car.
-- The driver's jamb-switch line, through a diode with its cathode on the line (a Schottky such as a BAT54). Opening the door grounds the line, which pulls D6 low. When the door is closed, the diode blocks the line's battery voltage. After System OFF, the driver opens the car once with the original key, and PKE works again from the next approach.
+- The driver's jamb-switch line, through a diode with its cathode on the line (a Schottky such as a BAT54). Opening the door grounds the line, which pulls D14 low. When the door is closed, the diode blocks the line's battery voltage. After System OFF, the driver opens the car once with the original key, and PKE works again from the next approach.
 
-If D6 is left unconnected, the pull-up holds it inactive. The unit never wakes on its own, so after 4 days it stays off until it is unplugged and plugged back in. If the wake input fails to set up at boot, the unit logs an error and stops at deep idle instead.
+**CAN bus activity also wakes the unit from System OFF** (`BUS_WAKE_ENABLED` in [car/src/door.h](car/src/door.h)). This is the reverse of the relay wake below: the car wakes the unit, not the unit the car. Opening the car with the key or the original remote, or opening a door, brings the bus up, and the gateway's NM frame then ticks on the OBD segment (see "Deep sleep is real"). Just before System OFF, `door_arm_bus_wake()` makes the MCP2515 pull INT low on the first bus activity, and gives its INT pin SENSE, the same way as the wake input:
+- With Sleep off (`MCP_SLEEP_ENABLED 0`, the default, since this module's crystal doesn't restart after Sleep), the chip is started in Listen-Only mode, which never ACKs or transmits. The first standard frame raises the receive interrupt the driver enabled at init. The transceiver is then put back in standby, where its receiver stays on. This draws a few mA, about what Configuration mode already draws between sessions.
+- With Sleep on, the chip sleeps with WAKIE set, and bus activity sets WAKIF.
 
-System OFF stops only the nRF52840. D7 keeps its level, so the transceiver stays in standby. The 12 V regulator's quiescent current and the transceiver's ~370 µA standby current set the unit's draw from then on.
+Either way, INT low reboots the nRF52840, and the driver resets the MCP2515 at boot. This needs no hardware change. If it works on the car (test in [tests/](tests/)), the hidden button and the jamb-switch diode become unnecessary. Until then, keep the wake input wired.
+
+If the MCP2515 fails to start at boot, only the wake input can wake the unit. If D14 is also left unconnected, the pull-up holds it inactive, and the unit never wakes on its own, so after 4 days it stays off until it is unplugged and plugged back in. If neither the wake input nor the CAN bus can wake it, the unit stops at deep idle instead.
+
+System OFF stops only the nRF52840. D7 keeps its level, so the transceiver stays in standby, its receiver still listening for the bus wake. The 12 V regulator's quiescent current and the transceiver's ~370 µA standby current set the unit's draw from then on.
 
 The fob sleeps when nobody carries it. The ADXL362 runs as a motion switch in wake-up mode (~270 nA), with INT1 high while the fob moves. After 60 s without an INT1 edge (`MOTION_IDLE_TIMEOUT_S` in [fob/src/motion.h](fob/src/motion.h)), the fob stops advertising and enters System OFF. It never sleeps while INT1 is high. With a car connected it waits twice as long at rest, then closes the link itself (`0x13`, which the car does not treat as an exit) before sleeping. While the car reports it is being driven, it does not sleep at all. The next movement wakes it through INT1, and it reboots and starts advertising again. If the ADXL362 doesn't answer at boot, the fob logs an error and never sleeps, since nothing could wake it.
 
@@ -222,7 +246,9 @@ Verify both with [obd-tool](../obd-tool) `tx`, with the car in READY:
 
 A few minutes after the car is parked, its ECUs sleep and CAN goes silent. A CAN frame needs at least one other node to ACK it, so the door frame fails with `code=7` (send timeout) and the transmit error counter climbs — at 255 the MCP2515 goes bus-off and stops transmitting until it's reset.
 
-### CAN wake-up was tried and does not work on this car
+### Waking the car over CAN was tried and does not work on this car
+
+This is about the unit waking the car. The other direction, the car's bus waking the unit from System OFF, is described under [Power](#power).
 
 There is no secret wake frame. Per ISO 11898-2 a transceiver leaves standby on any dominant–recessive–dominant bus activity, so *transmitting at all* is the wake signal. That was implemented (send a read-only OBD-II request on `0x7DF`, listen for any ECU to answer, then retry the door frame) and it **failed on the 2018 CT200h**:
 

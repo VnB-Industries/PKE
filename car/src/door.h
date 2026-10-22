@@ -11,6 +11,17 @@
 extern "C" {
 #endif
 
+/* ---- Bus wake (CAN activity wakes the unit from System OFF) ---- */
+/*
+ * The reverse of the relay wake: here the car wakes the unit, not the unit the car. Opening the
+ * car (key, original remote, a door) brings the bus up; the gateway's NM frame then ticks ~1 Hz on
+ * the OBD segment (README "Deep sleep is real"). Just before System OFF, door_arm_bus_wake() makes
+ * the MCP2515 pull INT low on the first bus activity, and the INT pin gets SENSE like the wake
+ * input. Validate on the car before relying on it alone (tests/reveil-unite-bus-can.md). Set to 0
+ * to leave System OFF to the wake input only.
+ */
+#define BUS_WAKE_ENABLED 1
+
 enum door_cmd {
 	DOOR_UNLOCK,
 	DOOR_LOCK,
@@ -38,6 +49,14 @@ void door_sleep(void);
  */
 int door_query(uint16_t req_id, const uint8_t req[8], uint16_t rsp_id, uint8_t rsp_span,
 	       uint8_t rsp[8], k_timeout_t timeout);
+
+/*
+ * Lets CAN bus activity wake the unit from System OFF: the MCP2515 pulls INT low on the first bus
+ * activity (Sleep with WAKIE, or Listen-Only when Sleep is off), and its INT pin gets SENSE. Call
+ * right before sys_poweroff(). Returns 0 or a negative errno, in which case only the wake input can
+ * wake the unit.
+ */
+int door_arm_bus_wake(void);
 
 #ifdef __cplusplus
 }

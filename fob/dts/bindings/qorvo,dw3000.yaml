@@ -1,0 +1,21 @@
+# Local binding until the DW3000 driver (Qorvo SDK, as in BLEUWB) is brought in.
+description: Qorvo DW3000 UWB transceiver (UWB3000F00 module)
+
+compatible: "qorvo,dw3000"
+
+include: spi-device.yaml
+
+properties:
+  irq-gpios:
+    type: phandle-array
+    required: true
+    description: IRQ output, active high.
+
+  reset-gpios:
+    type: phandle-array
+    required: true
+    description: RSTn, open drain. Pulled low to reset, then released; never driven high.
+
+  wakeup-gpios:
+    type: phandle-array
+    description: WAKEUP input, optional. Holding CS low ~500 us also leaves DEEPSLEEP.

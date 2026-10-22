@@ -1,21 +1,40 @@
 /*
  * Fob wiring on the XIAO nRF52840 (README "Hardware (fob)"):
  *   D1 ADXL362 CS    D2 ADXL362 INT1
- *   D8/D9/D10 ADXL362 SCLK/MISO/MOSI
+ *   D0 DW3000 CS     D3 DW3000 IRQ    D4 DW3000 RSTn    D5 DW3000 WAKEUP
+ *   D8/D9/D10 SCLK/MISO/MOSI, shared by both chips
  *
- * The node is only used for its SPI and INT1 specs: CONFIG_SENSOR stays off, so the
+ * The ADXL362 node is only used for its SPI and INT1 specs: CONFIG_SENSOR stays off, so the
  * Zephyr ADXL362 driver isn't built and motion.c drives the registers itself.
+ *
+ * The DW3000 (UWB3000F00) is not fitted yet and no driver uses its node. Its CS is still
+ * listed: the SPI driver drives every cs-gpios line inactive at boot, so D0 holds the DW3000
+ * deselected and its MISO released whenever the ADXL362 is addressed.
  */
 
 &xiao_spi {
 	status = "okay";
-	cs-gpios = <&xiao_d 1 GPIO_ACTIVE_LOW>;
+	cs-gpios = <&xiao_d 1 GPIO_ACTIVE_LOW>,	/* reg 0: ADXL362 */
+		   <&xiao_d 0 GPIO_ACTIVE_LOW>;	/* reg 1: DW3000 */
 
 	adxl362: adxl362@0 {
 		compatible = "adi,adxl362";
 		reg = <0>;
 		spi-max-frequency = <1000000>;
 		int1-gpios = <&xiao_d 2 GPIO_ACTIVE_HIGH>;
+	};
+
+	dw3000: dw3000@1 {
+		compatible = "qorvo,dw3000";
+		reg = <1>;
+		/* Up to 38 MHz per the datasheet; start slow and raise it once ranging works. */
+		spi-max-frequency = <8000000>;
+		/* Active high, the only polarity that works in SLEEP/DEEPSLEEP. */
+		irq-gpios = <&xiao_d 3 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+		/* Pull low to reset, then release: never drive it high. */
+		reset-gpios = <&xiao_d 4 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
+		wakeup-gpios = <&xiao_d 5 GPIO_ACTIVE_HIGH>;
+		status = "disabled";
 	};
 };
 

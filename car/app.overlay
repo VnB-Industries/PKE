@@ -1,10 +1,14 @@
 /*
- * Car unit wiring on the XIAO nRF52840 (README "Hardware"):
- *   D0 relay coil driver    D1 MCP2515 CS    D2 MCP2515 INT
- *   D3 INMP441 SCK          D4 INMP441 WS    D5 INMP441 SD
- *   D6 wake input (button or jamb-switch line through a diode, to GND)
- *   D7 SN65HVD230 Rs (high = standby)
- *   D8/D9/D10 MCP2515 SCK/MISO/MOSI
+ * Car unit wiring on the carte_uwb support board (README "Hardware (car unit)"). This pinout
+ * follows the board, which routes without crossings, so it must not change without a board
+ * revision:
+ *   D0 DW3000 SCK     D1 DW3000 RSTn    D2 DW3000 WAKEUP   D3 DW3000 MOSI
+ *   D4 DW3000 MISO    D5 DW3000 CS      D6 DW3000 IRQ
+ *   D7 SN65HVD230 Rs (high = standby)   D8 MCP2515 CS      D9 MCP2515 INT    D10 relay
+ *   D11/D12/D13 INMP441 SD/SCK/WS (bottom pads)
+ *   D14 wake input (bottom pad, J1 pin 11)
+ *   D17/D18/D19 MCP2515 SCK/MISO/MOSI (bottom pads)
+ * The bottom pads aren't on the xiao_d connector, so they are named by their nRF52840 pin.
  */
 
 / {
@@ -22,31 +26,42 @@
 
 	zephyr,user {
 		/* Energised = relay closed = jamb-switch line grounded = "driver's door open". */
-		relay-gpios = <&xiao_d 0 GPIO_ACTIVE_HIGH>;
-		/* Low = wake: brings the unit back from deep idle or System OFF (power.c). */
-		wake-gpios = <&xiao_d 6 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		relay-gpios = <&xiao_d 10 GPIO_ACTIVE_HIGH>;
+		/* D14 (P0.09). Low = wake: brings the unit back from deep idle or System OFF (power.c). */
+		wake-gpios = <&gpio0 9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 	};
 };
 
-/* D6/D7 are free for GPIO: the console is the USB serial port, not this UART. */
+/* P0.09/P0.10 (D14/D15) are NFC pins until this is set. Leave D15 unconnected. */
+&uicr {
+	nfct-pins-as-gpios;
+};
+
+/* D6/D7 carry the UWB IRQ and CAN Rs: the console is the USB serial port, not this UART. */
 &uart0 {
 	status = "disabled";
 };
 
-/* D4/D5 carry the I2S word select and data instead of I2C. */
+/* D4/D5 carry the UWB MISO and CS instead of I2C. */
 &i2c1 {
 	status = "disabled";
 };
 
+/* CAN on the bottom pads D17-D19; CS and INT on D8/D9, the board's CAN side. */
 &xiao_spi {
-	cs-gpios = <&xiao_d 1 GPIO_ACTIVE_LOW>;
+	pinctrl-0 = <&spi2_can_default>;
+	pinctrl-1 = <&spi2_can_sleep>;
+	cs-gpios = <&xiao_d 8 GPIO_ACTIVE_LOW>;
 
 	mcp2515: can@0 {
 		compatible = "microchip,mcp2515";
 		reg = <0>;
-		/* MCP2515 max is 10 MHz. At 1 MHz the driver can't drain a busy 500 kbit/s bus (RX0OVR). */
+		/*
+		 * MCP2515 max is 10 MHz. At 1 MHz the driver can't drain a busy 500 kbit/s bus (RX0OVR).
+		 * Here the SPI runs down the J1 cable to the OBD box: lower it if frames come back corrupt.
+		 */
 		spi-max-frequency = <8000000>;
-		int-gpios = <&xiao_d 2 GPIO_ACTIVE_LOW>;
+		int-gpios = <&xiao_d 9 GPIO_ACTIVE_LOW>;
 		/* Check the crystal printed on the module: a wrong value still starts, but frames won't ACK. */
 		osc-freq = <8000000>;
 		bitrate = <500000>;
@@ -55,20 +70,78 @@
 	};
 };
 
+/* The DW3000 has its own bus, so UWB exchanges never wait behind a CAN transfer. */
+&spi3 {
+	compatible = "nordic,nrf-spim";
+	status = "okay";
+	pinctrl-0 = <&spi3_uwb_default>;
+	pinctrl-1 = <&spi3_uwb_sleep>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&xiao_d 5 GPIO_ACTIVE_LOW>;
+
+	/* No driver yet (Qorvo SDK, as in BLEUWB): the node only records the wiring. */
+	dw3000: dw3000@0 {
+		compatible = "qorvo,dw3000";
+		reg = <0>;
+		/* Up to 38 MHz per the datasheet, 32 MHz on SPIM3; start slow and raise it once ranging works. */
+		spi-max-frequency = <8000000>;
+		/* Active high, the only polarity that works in SLEEP/DEEPSLEEP. */
+		irq-gpios = <&xiao_d 6 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+		/* Pull low to reset, then release: never drive it high. */
+		reset-gpios = <&xiao_d 1 (GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN)>;
+		wakeup-gpios = <&xiao_d 2 GPIO_ACTIVE_HIGH>;
+		status = "disabled";
+	};
+};
+
 &pinctrl {
+	spi2_can_default: spi2_can_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 1, 3)>,
+				<NRF_PSEL(SPIM_MISO, 1, 5)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 7)>;
+		};
+	};
+
+	spi2_can_sleep: spi2_can_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 1, 3)>,
+				<NRF_PSEL(SPIM_MISO, 1, 5)>,
+				<NRF_PSEL(SPIM_MOSI, 1, 7)>;
+			low-power-enable;
+		};
+	};
+
+	spi3_uwb_default: spi3_uwb_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 2)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 29)>,
+				<NRF_PSEL(SPIM_MISO, 0, 4)>;
+		};
+	};
+
+	spi3_uwb_sleep: spi3_uwb_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 2)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 29)>,
+				<NRF_PSEL(SPIM_MISO, 0, 4)>;
+			low-power-enable;
+		};
+	};
+
 	i2s0_default: i2s0_default {
 		group1 {
-			psels = <NRF_PSEL(I2S_SCK_M, 0, 29)>,
-				<NRF_PSEL(I2S_LRCK_M, 0, 4)>,
-				<NRF_PSEL(I2S_SDIN, 0, 5)>;
+			psels = <NRF_PSEL(I2S_SCK_M, 0, 19)>,
+				<NRF_PSEL(I2S_LRCK_M, 1, 1)>,
+				<NRF_PSEL(I2S_SDIN, 0, 15)>;
 		};
 	};
 
 	i2s0_sleep: i2s0_sleep {
 		group1 {
-			psels = <NRF_PSEL(I2S_SCK_M, 0, 29)>,
-				<NRF_PSEL(I2S_LRCK_M, 0, 4)>,
-				<NRF_PSEL(I2S_SDIN, 0, 5)>;
+			psels = <NRF_PSEL(I2S_SCK_M, 0, 19)>,
+				<NRF_PSEL(I2S_LRCK_M, 1, 1)>,
+				<NRF_PSEL(I2S_SDIN, 0, 15)>;
 			low-power-enable;
 		};
 	};

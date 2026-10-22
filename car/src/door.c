@@ -13,6 +13,7 @@
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/can.h>
+#include <zephyr/drivers/can/transceiver.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/kernel.h>
@@ -28,6 +29,12 @@ static const struct device *const can_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbu
 /* Raw access to the same chip, for the Sleep mode the Zephyr driver doesn't offer. */
 static const struct spi_dt_spec mcp_spi =
 	SPI_DT_SPEC_GET(DT_CHOSEN(zephyr_canbus), SPI_OP_MODE_MASTER | SPI_WORD_SET(8));
+#if BUS_WAKE_ENABLED
+static const struct gpio_dt_spec can_int = GPIO_DT_SPEC_GET(DT_CHOSEN(zephyr_canbus), int_gpios);
+#if !MCP_SLEEP_ENABLED
+static const struct device *const can_phy = DEVICE_DT_GET(DT_PHANDLE(DT_CHOSEN(zephyr_canbus), phys));
+#endif
+#endif
 #if RELAY_WAKE_ENABLED
 static const struct gpio_dt_spec relay = GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), relay_gpios);
 #endif
@@ -151,7 +158,8 @@ static int mcp_read(uint8_t addr, uint8_t *value)
 
 /*
  * Puts the MCP2515 in Sleep mode, a few uA. can_stop() first aborts any pending frame and tells the
- * driver it is stopped. WAKIE stays off outside mcp_wake(), so bus activity doesn't wake the chip.
+ * driver it is stopped. WAKIE stays off outside mcp_wake() and door_arm_bus_wake(), so bus activity
+ * doesn't wake the chip.
  * The chip only enters Sleep once the bus is idle, which can take longer than the check below, so it
  * counts as asleep either way: mcp_wake() on a chip that is already awake does no harm, while a
  * mode request to a sleeping chip times out. Call with door_mutex held.
@@ -520,3 +528,49 @@ out:
 	k_mutex_unlock(&door_mutex);
 	return err;
 }
+
+#if BUS_WAKE_ENABLED
+int door_arm_bus_wake(void)
+{
+	int err;
+
+	k_mutex_lock(&door_mutex, K_FOREVER);
+#if MCP_SLEEP_ENABLED
+	if (!mcp_asleep) {
+		mcp_sleep();
+	}
+	/*
+	 * Bus activity now wakes the chip, which sets WAKIF and pulls INT low. The driver resets the
+	 * MCP2515 at the next boot, which clears WAKIE and WAKIF again.
+	 */
+	err = mcp_bit_modify(MCP_ADDR_CANINTE, MCP_CANINTE_WAKIE, MCP_CANINTE_WAKIE);
+#else
+	/*
+	 * Sleep is off on this module (MCP_SLEEP_ENABLED), so the chip listens instead: Listen-Only
+	 * never ACKs or transmits, and the first standard frame raises the receive interrupt the driver
+	 * enabled at init, which pulls INT low. The transceiver then goes back to standby, where its
+	 * receiver stays on. A few mA, about what Configuration mode already draws between sessions.
+	 */
+	can_stop(can_dev);
+	can_ready = false;
+	err = can_set_mode(can_dev, CAN_MODE_LISTENONLY);
+	if (!err) {
+		err = can_start(can_dev);
+	}
+	if (!err) {
+		err = can_transceiver_disable(can_phy);
+	}
+#endif
+	if (!err) {
+		/* A level interrupt sets the pin's SENSE, which is what wakes the chip from System OFF. */
+		err = gpio_pin_interrupt_configure_dt(&can_int, GPIO_INT_LEVEL_ACTIVE);
+	}
+	k_mutex_unlock(&door_mutex);
+	return err;
+}
+#else
+int door_arm_bus_wake(void)
+{
+	return -ENOTSUP;
+}
+#endif
