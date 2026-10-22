@@ -33,6 +33,26 @@ static const uint8_t UNLOCK_CMD_DATA[8] = {0x40, 0x05, 0x30, 0x11, 0x00, 0x40, 0
  */
 #define BUS_AWAKE_TIMEOUT_MS 2000
 
+/* ---- MCP2515 Sleep mode (door_sleep()) ---- */
+/*
+ * Outside a fob session the MCP2515 sleeps at a few uA. Register values are from the MCP2515
+ * datasheet; the Zephyr driver keeps its own copies private.
+ */
+#define MCP_OPCODE_READ       0x03
+#define MCP_OPCODE_BIT_MODIFY 0x05
+#define MCP_ADDR_CANSTAT      0x0E
+#define MCP_ADDR_CANCTRL      0x0F
+#define MCP_ADDR_CANINTF      0x2C
+#define MCP_MODE_MASK         0xE0 /* CANCTRL.REQOP / CANSTAT.OPMOD */
+#define MCP_MODE_SLEEP        0x20
+#define MCP_CANINTF_WAKIF     0x40
+#define MCP_OSC_START_MS      5    /* crystal start-up after WAKIF, before talking to the chip */
+/*
+ * After a wake the chip has missed everything, so listen this long before judging the bus. The
+ * gateway's NM frame ticks ~1 Hz while the bus is responsive.
+ */
+#define CAN_WAKE_LISTEN_MS    1200
+
 /* ---- Relay wake (drives the driver's-door jamb-switch line to wake a sleeping body ECU) ---- */
 /*
  * In deep sleep (~10+ min idle) the body ECU no longer listens on CAN, so no frame can reach it

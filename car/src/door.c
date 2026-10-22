@@ -14,6 +14,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/can.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/spi.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
@@ -24,6 +25,9 @@
 LOG_MODULE_REGISTER(door, LOG_LEVEL_INF);
 
 static const struct device *const can_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbus));
+/* Raw access to the same chip, for the Sleep mode the Zephyr driver doesn't offer. */
+static const struct spi_dt_spec mcp_spi =
+	SPI_DT_SPEC_GET(DT_CHOSEN(zephyr_canbus), SPI_OP_MODE_MASTER | SPI_WORD_SET(8));
 #if RELAY_WAKE_ENABLED
 static const struct gpio_dt_spec relay = GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), relay_gpios);
 #endif
@@ -34,6 +38,7 @@ static K_SEM_DEFINE(reply_sem, 0, 1);
 static K_SEM_DEFINE(rx_sem, 0, 1);
 
 static bool can_ready;
+static bool mcp_asleep;
 static int filter_id = -1;
 static int tx_err;
 static uint8_t reply[4];
@@ -106,6 +111,76 @@ static void restart_can(void)
 		LOG_ERR("CAN restart failed");
 		can_ready = false;
 	}
+}
+
+static int mcp_bit_modify(uint8_t addr, uint8_t mask, uint8_t value)
+{
+	uint8_t cmd[] = {MCP_OPCODE_BIT_MODIFY, addr, mask, value};
+	const struct spi_buf buf = {.buf = cmd, .len = sizeof(cmd)};
+	const struct spi_buf_set tx = {.buffers = &buf, .count = 1};
+
+	return spi_write_dt(&mcp_spi, &tx);
+}
+
+static int mcp_read(uint8_t addr, uint8_t *value)
+{
+	uint8_t cmd[3] = {MCP_OPCODE_READ, addr, 0};
+	uint8_t rsp[3];
+	const struct spi_buf tx_buf = {.buf = cmd, .len = sizeof(cmd)};
+	const struct spi_buf rx_buf = {.buf = rsp, .len = sizeof(rsp)};
+	const struct spi_buf_set tx = {.buffers = &tx_buf, .count = 1};
+	const struct spi_buf_set rx = {.buffers = &rx_buf, .count = 1};
+	int err = spi_transceive_dt(&mcp_spi, &tx, &rx);
+
+	*value = rsp[2];
+	return err;
+}
+
+/*
+ * Puts the MCP2515 in Sleep mode, a few uA. can_stop() first aborts any pending frame and tells the
+ * driver it is stopped. WAKIE stays off (the driver never sets it), so bus activity doesn't wake
+ * the chip: only mcp_wake() does. Call with door_mutex held.
+ */
+static void mcp_sleep(void)
+{
+	uint8_t canstat = 0;
+
+	can_stop(can_dev);
+	can_ready = false;
+	mcp_bit_modify(MCP_ADDR_CANCTRL, MCP_MODE_MASK, MCP_MODE_SLEEP);
+	for (int i = 0; i < 10; i++) {
+		if (!mcp_read(MCP_ADDR_CANSTAT, &canstat) &&
+		    (canstat & MCP_MODE_MASK) == MCP_MODE_SLEEP) {
+			mcp_asleep = true;
+			LOG_INF("MCP2515 asleep");
+			return;
+		}
+		k_sleep(K_MSEC(1));
+	}
+	LOG_WRN("MCP2515 did not enter Sleep (CANSTAT 0x%02X)", canstat);
+}
+
+/*
+ * Setting WAKIF by hand wakes the chip as bus activity would. It restarts its oscillator and comes up
+ * in Listen-Only mode; can_start() then returns it to normal mode. Since nothing was received while
+ * it slept, it listens for a moment so bus_awake() reflects the bus as it is now. Call with
+ * door_mutex held.
+ */
+static void mcp_wake(void)
+{
+	mcp_bit_modify(MCP_ADDR_CANINTF, MCP_CANINTF_WAKIF, MCP_CANINTF_WAKIF);
+	k_sleep(K_MSEC(MCP_OSC_START_MS));
+	mcp_bit_modify(MCP_ADDR_CANINTF, MCP_CANINTF_WAKIF, 0);
+	mcp_asleep = false;
+
+	if (can_start(can_dev)) {
+		LOG_ERR("MCP2515 wake failed");
+		return;
+	}
+	can_ready = true;
+	LOG_INF("MCP2515 awake, listening for bus traffic...");
+	k_sem_reset(&rx_sem);
+	k_sem_take(&rx_sem, K_MSEC(CAN_WAKE_LISTEN_MS));
 }
 
 static int send_frame(const uint8_t data[8])
@@ -210,6 +285,9 @@ bool door_send(enum door_cmd cmd)
 	bool ok = false;
 
 	k_mutex_lock(&door_mutex, K_FOREVER);
+	if (mcp_asleep) {
+		mcp_wake();
+	}
 	if (!can_ready) {
 		can_ready = start_can() == 0;
 	}
@@ -258,5 +336,21 @@ int door_init(void)
 	}
 #endif
 	can_ready = start_can() == 0;
-	return can_ready ? 0 : -ENODEV;
+	if (!can_ready) {
+		return -ENODEV;
+	}
+	/* No fob yet: the controller sleeps until the first command. */
+	k_mutex_lock(&door_mutex, K_FOREVER);
+	mcp_sleep();
+	k_mutex_unlock(&door_mutex);
+	return 0;
+}
+
+void door_sleep(void)
+{
+	k_mutex_lock(&door_mutex, K_FOREVER);
+	if (!mcp_asleep) {
+		mcp_sleep();
+	}
+	k_mutex_unlock(&door_mutex);
 }

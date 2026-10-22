@@ -51,7 +51,7 @@ No LEDs are used, to keep consumption down. Everything is reported on the USB se
 1. **Enrollment**: `scripts/gen_keys.py` creates the shared secret, the fob IRK and the fob static identity address. They are compiled into both firmwares.
 2. **Discovery**: the fob's RPA rotates every 60 s (`CONFIG_BT_RPA_TIMEOUT`, short for testing). The car resolves it on the host with AES-ECB. It connects once the filtered advert RSSI holds -70 dBm for 3 samples.
 3. **Authenticated exchange**: the link is encrypted with LE Secure Connections Just Works, without bonding. On top of it, both sides prove they hold the secret with HMAC-SHA256 over two fresh nonces, then derive a session key with HKDF-SHA256. Both log the same `key id`, a hash prefix of the key, never the key itself.
-4. **Mic on**: the car starts the tap listener. It stops again when the session ends, whether by a lock or a lost link.
+4. **Mic on**: the car starts the tap listener. It stops again when the session ends, whether by a lock or a lost link, and the MCP2515 goes back to Sleep.
 5. **UWB ranging**: dummy for now, and it always passes ([ranging.c](car/src/ranging.c)).
 6. **Unlock**: the car sends the unlock frame ([door.c](car/src/door.c)), with the relay wake if the bus is asleep. The session stays up even if delivery failed; a double tap retries it.
 7. **Exit detection**: the car polls the link RSSI every 250 ms. An exit starts when the filtered RSSI stays below -80 dBm for 5 samples. The vehicle precondition ([vehicle.c](car/src/vehicle.c)) is a stub that always returns true.
@@ -74,6 +74,17 @@ The detector in [car/src/tap/](car/src/tap/) is a copy of [../tapDetector/src](.
 ### Power
 
 The car unit is built to idle at the lowest draw the radio allows. There are no LEDs. The I2S clock runs only during an authenticated session. CAN reception is interrupt-driven, and the relay dwell sleeps on a semaphore instead of polling.
+
+The MCP2515 sleeps outside a fob session, at a few µA, with no hardware change. An SPI Bit Modify sets REQOP in CANCTRL to Sleep (`0x20`). WAKIE stays off, so bus traffic can't wake it. The first `door_send()` of a session wakes it:
+1. Set WAKIF in CANINTF with a Bit Modify.
+2. Wait 5 ms for the crystal to start.
+3. Clear WAKIF. The chip is now in Listen-Only mode.
+4. `can_start()` returns it to normal mode.
+5. Listen for up to 1.2 s, so the bus-awake check sees the bus as it is now.
+
+That adds up to ~1.2 s to the first unlock of a session. At the end of the session, `door_sleep()` puts it back to sleep. While asleep it doesn't ACK, the same as an empty OBD port.
+
+The CAN transceiver module stays powered, and its draw depends on how its standby pin (Rs) is wired.
 
 Fob battery budget: chip sleep is a few µA, BLE bursts are a few mA, and UWB ranging (once fitted) averages ~21 mA with 72 mA peaks. Battery life therefore depends on keeping UWB asleep except for brief ranging bursts. A CR2032 needs a 100–470 µF buffer cap near the UWB module. A LiPo must feed the UWB module from the regulated 3.3 V pin: a charged cell (~4.2 V) is above the UWB3000F00's 3.6 V maximum.
 
