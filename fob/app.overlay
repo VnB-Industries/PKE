@@ -18,3 +18,30 @@
 		int1-gpios = <&xiao_d 2 GPIO_ACTIVE_HIGH>;
 	};
 };
+
+/*
+ * Onboard LiPo charger (Seeed XIAO nRF52840 schematic, not in the Zephyr board files):
+ *   P0.17 BQ25101 CHG, low while charging
+ *   P0.14 low switches on the 1M/510k divider from BAT+ to P0.31 (AIN7)
+ */
+/ {
+	zephyr,user {
+		chg-gpios = <&gpio0 17 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		vbat-en-gpios = <&gpio0 14 GPIO_ACTIVE_LOW>;
+		io-channels = <&adc 7>;
+	};
+};
+
+&adc {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@7 {
+		reg = <7>;
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_AIN7>;
+		zephyr,resolution = <12>;
+	};
+};

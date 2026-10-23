@@ -5,7 +5,7 @@
 #include <stdbool.h>
 
 /* No ADXL362 interrupt for this long puts the fob in System OFF. */
-#define MOTION_IDLE_TIMEOUT_S 300
+#define MOTION_IDLE_TIMEOUT_S 60
 
 /*
  * Configures the ADXL362 as an autonomous motion switch and starts the idle

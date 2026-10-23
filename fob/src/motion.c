@@ -14,6 +14,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/logging/log_ctrl.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/poweroff.h>
 
 #include "motion.h"
@@ -25,6 +26,7 @@ LOG_MODULE_REGISTER(motion, LOG_LEVEL_INF);
 
 #define ADXL_REG_DEVID_AD 0x00
 #define ADXL_REG_PARTID 0x02
+#define ADXL_REG_XDATA_L 0x0E
 #define ADXL_REG_SOFT_RESET 0x1F
 #define ADXL_REG_THRESH_ACT_L 0x20
 #define ADXL_REG_THRESH_INACT_L 0x23
@@ -90,18 +92,23 @@ static int adxl_write_u16(uint8_t reg, uint16_t val)
 	return adxl_write(reg, le, sizeof(le));
 }
 
+static int adxl_read(uint8_t reg, uint8_t *val, size_t len)
+{
+	uint8_t hdr[2] = {ADXL_CMD_READ, reg};
+	const struct spi_buf tx_buf = {.buf = hdr, .len = sizeof(hdr)};
+	const struct spi_buf rx_bufs[] = {
+		{.buf = NULL, .len = sizeof(hdr)},
+		{.buf = val, .len = len},
+	};
+	const struct spi_buf_set tx = {.buffers = &tx_buf, .count = 1};
+	const struct spi_buf_set rx = {.buffers = rx_bufs, .count = ARRAY_SIZE(rx_bufs)};
+
+	return spi_transceive_dt(&adxl_spi, &tx, &rx);
+}
+
 static int adxl_read_u8(uint8_t reg, uint8_t *val)
 {
-	uint8_t tx_data[3] = {ADXL_CMD_READ, reg, 0};
-	uint8_t rx_data[3];
-	const struct spi_buf tx_buf = {.buf = tx_data, .len = sizeof(tx_data)};
-	const struct spi_buf rx_buf = {.buf = rx_data, .len = sizeof(rx_data)};
-	const struct spi_buf_set tx = {.buffers = &tx_buf, .count = 1};
-	const struct spi_buf_set rx = {.buffers = &rx_buf, .count = 1};
-	int err = spi_transceive_dt(&adxl_spi, &tx, &rx);
-
-	*val = rx_data[2];
-	return err;
+	return adxl_read(reg, val, 1);
 }
 
 static int adxl_configure(void)
@@ -148,9 +155,53 @@ static int adxl_configure(void)
 	return err;
 }
 
+/*
+ * Debug: while INT1 stays high, reads XYZ every 50 ms (faster than the ~6 Hz
+ * wake-up rate, so every chip sample is seen) and logs each axis' min/max once
+ * a second. A span above INACT_THRESHOLD_MG restarts the chip's inactivity count.
+ */
+#define DUMP_PERIOD_MS 50
+#define DUMP_READS 20
+
+static void dump_expired(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(dump_work, dump_expired);
+
+static void dump_expired(struct k_work *work)
+{
+	static int16_t lo[3], hi[3];
+	static int reads;
+	uint8_t raw[6];
+
+	if (gpio_pin_get_dt(&int1) <= 0) {
+		reads = 0;
+		return;
+	}
+	if (!adxl_read(ADXL_REG_XDATA_L, raw, sizeof(raw))) {
+		for (int i = 0; i < 3; i++) {
+			int16_t v = sys_get_le16(&raw[2 * i]);
+
+			if (reads == 0 || v < lo[i]) {
+				lo[i] = v;
+			}
+			if (reads == 0 || v > hi[i]) {
+				hi[i] = v;
+			}
+		}
+		if (++reads == DUMP_READS) {
+			LOG_INF("x %d..%d (%d) y %d..%d (%d) z %d..%d (%d) mg",
+				lo[0], hi[0], hi[0] - lo[0], lo[1], hi[1], hi[1] - lo[1],
+				lo[2], hi[2], hi[2] - lo[2]);
+			reads = 0;
+		}
+	}
+	k_work_reschedule(&dump_work, K_MSEC(DUMP_PERIOD_MS));
+}
+
 /* Both edges count: the fob starting to move, and coming to rest. */
 static void int1_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
+	LOG_INF("ADXL362 INT1: %s", gpio_pin_get_dt(&int1) > 0 ? "moving" : "at rest");
+	k_work_reschedule(&dump_work, K_NO_WAIT);
 	k_work_reschedule(&idle_work, K_SECONDS(MOTION_IDLE_TIMEOUT_S));
 }
 

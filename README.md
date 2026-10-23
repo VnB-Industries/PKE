@@ -49,12 +49,20 @@ The pins are set in [car/app.overlay](car/app.overlay). Set `osc-freq` there to 
 | D8 / D9 / D10 | ADXL362 SCLK / MISO / MOSI |
 | 3V3 / GND | ADXL362 VS and VIO |
 
+The XIAO also wires its charger to internal pins, which the firmware reads (from Seeed's schematic, not the Zephyr board files):
+
+| nRF52840 pin | Onboard connection |
+| --- | --- |
+| P0.17 | BQ25101 CHG, low while charging |
+| P0.14 | low switches on the 1M/510k divider from BAT+ |
+| P0.31 (AIN7) | battery voltage through that divider |
+
 The pins are set in [fob/app.overlay](fob/app.overlay). The ADXL362 must stay powered from 3V3 when the fob is in System OFF: it is the only thing that can wake it. Leave INT1 on a pin with no pull-up or LED; the line idles low.
 
 The fob has two power states:
 
 - **Carried**: the fob advertises every ~250 ms and answers the car. The DW3000 will be powered only during a car session, for the 3–5 ranging rounds, and kept off otherwise.
-- **At rest**: after 5 minutes without movement, the fob stops advertising and enters System OFF. Only the ADXL362 (~270 nA) and the nRF52840's wake logic stay powered. The next movement wakes it, and it boots and advertises again.
+- **At rest**: after 1 minute without movement, the fob stops advertising and enters System OFF. Only the ADXL362 (~270 nA) and the nRF52840's wake logic stay powered. The next movement wakes it, and it boots and advertises again.
 
 Details are under [Power](#power).
 
@@ -137,7 +145,17 @@ If D6 is left unconnected, the pull-up holds it inactive. The unit never wakes o
 
 System OFF stops only the nRF52840. D7 keeps its level, so the transceiver stays in standby. The 12 V regulator's quiescent current and the transceiver's ~370 µA standby current set the unit's draw from then on.
 
-The fob sleeps when nobody carries it. The ADXL362 runs as a motion switch in wake-up mode (~270 nA), with INT1 high while the fob moves. After 5 minutes without an INT1 edge (`MOTION_IDLE_TIMEOUT_S` in [fob/src/motion.h](fob/src/motion.h)), the fob stops advertising and enters System OFF. It never sleeps during a car session or while INT1 is high. The next movement wakes it through INT1, and it reboots and starts advertising again. If the ADXL362 doesn't answer at boot, the fob logs an error and never sleeps, since nothing could wake it.
+The fob sleeps when nobody carries it. The ADXL362 runs as a motion switch in wake-up mode (~270 nA), with INT1 high while the fob moves. After 1 minute without an INT1 edge (`MOTION_IDLE_TIMEOUT_S` in [fob/src/motion.h](fob/src/motion.h)), the fob stops advertising and enters System OFF. It never sleeps during a car session or while INT1 is high. The next movement wakes it through INT1, and it reboots and starts advertising again. If the ADXL362 doesn't answer at boot, the fob logs an error and never sleeps, since nothing could wake it.
+
+At every boot, including each wake from System OFF, the fob logs the battery once ([fob/src/battery.c](fob/src/battery.c)):
+
+```
+<inf> battery: battery 3987 mV, charging
+```
+
+"not charging" means either full or no USB power; the voltage tells them apart (~4.2 V on USB means full). The divider is switched on only for the reading. With no cell connected, the voltage is meaningless.
+
+The BQ25101 charges the cell from USB-C on its own, so charging continues while the nRF52840 is in System OFF. The firmware leaves P0.13 (charge current: low 100 mA, high 50 mA) unconfigured, so the board's default applies.
 
 Fob battery budget: chip sleep is a few µA, BLE bursts are a few mA, and UWB ranging (once fitted) averages ~21 mA with 72 mA peaks. Battery life therefore depends on keeping UWB asleep except for brief ranging bursts. A CR2032 needs a 100–470 µF buffer cap near the UWB module. A LiPo must feed the UWB module from the regulated 3.3 V pin: a charged cell (~4.2 V) is above the UWB3000F00's 3.6 V maximum.
 

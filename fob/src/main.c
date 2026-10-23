@@ -5,7 +5,7 @@
  * Bluetooth callbacks only queue events; the crypto and the replies run in the
  * main thread, which owns all the state below.
  *
- * Five minutes without motion (motion.c) stops advertising and puts the fob in
+ * One minute without motion (motion.c) stops advertising and puts the fob in
  * System OFF; the next movement wakes it, and it boots and advertises again.
  */
 #include <errno.h>
@@ -19,6 +19,7 @@
 #include <zephyr/bluetooth/gatt.h>
 
 #include "keys.h"
+#include "battery.h"
 #include "motion.h"
 #include "pke_crypto.h"
 #include "pke_protocol.h"
@@ -284,6 +285,7 @@ int main(void)
 	}
 	bt_addr_le_to_str(&id_addr, addr_str, sizeof(addr_str));
 	LOG_INF("fob ready, identity %s", addr_str);
+	battery_log_state();
 	err = motion_init(motion_idle);
 	if (err) {
 		LOG_ERR("motion sensor init failed (err %d), fob will never sleep", err);
