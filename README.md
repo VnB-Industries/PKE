@@ -62,7 +62,7 @@ The pins are set in [fob/app.overlay](fob/app.overlay). The ADXL362 must stay po
 The fob has two power states:
 
 - **Carried**: the fob advertises every ~250 ms and answers the car. The DW3000 will be powered only during a car session, for the 3–5 ranging rounds, and kept off otherwise.
-- **At rest**: after 1 minute without movement, the fob stops advertising and enters System OFF. Only the ADXL362 (~270 nA) and the nRF52840's wake logic stay powered. The next movement wakes it, and it boots and advertises again.
+- **At rest**: after 5 minutes without movement, the fob stops advertising and enters System OFF. Only the ADXL362 (~270 nA) and the nRF52840's wake logic stay powered. The next movement wakes it, and it boots and advertises again.
 
 Details are under [Power](#power).
 
@@ -145,7 +145,24 @@ If D6 is left unconnected, the pull-up holds it inactive. The unit never wakes o
 
 System OFF stops only the nRF52840. D7 keeps its level, so the transceiver stays in standby. The 12 V regulator's quiescent current and the transceiver's ~370 µA standby current set the unit's draw from then on.
 
-The fob sleeps when nobody carries it. The ADXL362 runs as a motion switch in wake-up mode (~270 nA), with INT1 high while the fob moves. After 1 minute without an INT1 edge (`MOTION_IDLE_TIMEOUT_S` in [fob/src/motion.h](fob/src/motion.h)), the fob stops advertising and enters System OFF. It never sleeps during a car session or while INT1 is high. The next movement wakes it through INT1, and it reboots and starts advertising again. If the ADXL362 doesn't answer at boot, the fob logs an error and never sleeps, since nothing could wake it.
+The fob sleeps when nobody carries it. The ADXL362 runs as a motion switch in wake-up mode (~270 nA), with INT1 high while the fob moves. After 5 minutes without an INT1 edge (`MOTION_IDLE_TIMEOUT_S` in [fob/src/motion.h](fob/src/motion.h)), the fob stops advertising and enters System OFF. It never sleeps during a car session or while INT1 is high. The next movement wakes it through INT1, and it reboots and starts advertising again. If the ADXL362 doesn't answer at boot, the fob logs an error and never sleeps, since nothing could wake it.
+
+The chip decides on its own when the fob is at rest ([fob/src/motion.c](fob/src/motion.c)). Movement is more than 250 mg away from its reference on any axis (`ACT_THRESHOLD_MG`). Rest is all axes within 150 mg of the reference (`INACT_THRESHOLD_MG`) for 30 consecutive samples (`INACT_SAMPLES`), ~5 s at the ~6 Hz wake-up rate. A single sample beyond 150 mg restarts that count. Each INT1 edge is logged:
+
+```
+<inf> motion: ADXL362 INT1: moving
+<inf> motion: ADXL362 INT1: at rest
+```
+
+INT1 normally drops 5–6 s after the fob is put down.
+
+**Known issue, under investigation:** INT1 sometimes stays high for minutes while the fob lies still: 1 Hz reads vary by less than 150 mg, yet no "at rest" edge comes. The fob then never sleeps, since `motion_active()` keeps deferring the idle timer. The suspected cause is noise between the 1 Hz reads, with single samples beyond 150 mg that keep restarting the inactivity count. The fob firmware carries a temporary debug dump for this: while INT1 is high, it reads XYZ every 50 ms, which catches every chip sample, and logs each axis's min..max and span once a second:
+
+```
+<inf> motion: x 1052..1191 (139) y -25..-2 (23) z -104..-45 (59) mg
+```
+
+A span regularly above 150 mg at rest points to noise: raise `INACT_THRESHOLD_MG` (~250–300 mg) or enable the ADXL362 low-noise mode. Spans well under 150 mg point to the chip: add a software fallback that resets the ADXL362 when the idle timer expires with INT1 still high. Remove the dump (`dump_work` in motion.c) once this is settled: it keeps SPI busy every 50 ms while the fob moves.
 
 At every boot, including each wake from System OFF, the fob logs the battery once ([fob/src/battery.c](fob/src/battery.c)):
 
