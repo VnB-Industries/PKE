@@ -51,9 +51,15 @@ west build "${PRISTINE[@]}" -b xiao_ble/nrf52840 "$ROOT/$APP" -d "$ROOT/build/$A
 
 echo
 echo ">>> Double-tap reset on the $APP board (only that one)."
+INFO=
 for _ in $(seq 60); do
-	compgen -G "/media/$USER/*/INFO_UF2.TXT" >/dev/null && break
-	compgen -G "/run/media/$USER/*/INFO_UF2.TXT" >/dev/null && break
+	INFO=$(compgen -G "/media/$USER/*/INFO_UF2.TXT" || compgen -G "/run/media/$USER/*/INFO_UF2.TXT" || true)
+	[ -n "$INFO" ] && break
 	sleep 1
 done
-west flash -d "$ROOT/build/$APP"
+[ -n "$INFO" ] || { echo "no UF2 bootloader drive found" >&2; exit 1; }
+# Plain cp instead of west flash: the bootloader reboots and unmounts the drive as soon as
+# the image is written, and west's uf2 runner then fails on a chmod of the vanished file.
+DRIVE=$(dirname "$(head -1 <<<"$INFO")")
+cp "$ROOT/build/$APP/$APP/zephyr/zephyr.uf2" "$DRIVE/" 2>/dev/null || [ ! -d "$DRIVE" ]
+echo ">>> Flashed $APP via $DRIVE"
