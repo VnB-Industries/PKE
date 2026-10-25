@@ -29,12 +29,14 @@ The earlier ESP32 Arduino firmware (tap-only, no BLE) is on the `ESP32/main` bra
 | D6 | wake input, optional: push button to GND, and/or the driver's jamb-switch line through a diode (cathode to the line) |
 | D7 | SN65HVD230 Rs (standby control) |
 | D8 / D9 / D10 | MCP2515 SCK / MISO / MOSI |
-| 3V3 / GND | MCP2515 + SN65HVD230 module, INMP441 (L/R → GND) |
+| 3V3 / GND | INMP441 (L/R → GND). GND also goes to the MCP2515 module. The module needs its own 3.3 V supply: see below. |
 
 The pins are set in [car/app.overlay](car/app.overlay). Set `osc-freq` there to match the crystal on your MCP2515 module (8 MHz by default). A wrong value still starts, but frames won't ACK. The CAN bitrate is 500 kbit/s. The UWB module is not fitted yet.
 
 **Important notes before assembly:**
 
+- **Don't power the CAN module from the XIAO's 3V3 pin**: the XIAO's regulator holds 3.3 V at rest, but it can't deliver the SN65HVD230's current bursts when it transmits. Measured on the car: from the XIAO's 3V3, every transmitted frame failed with bit errors (`TXB0CTRL 18`) and the MCP2515 went bus-off, while receiving still worked. The same module powered from another 3.3 V supply transmitted fine with the same XIAO and firmware. The weak supply also left the MCP2515 unconfigured at boot (`CNF 00 00 00`, `CANINTE 00`), which the firmware now detects and repairs (`mcp_restore_config()` in [car/src/door.c](car/src/door.c)). Feed the module from its own 3.3 V regulator (e.g. an MCP1700 or AMS1117-3.3), with its GND tied to the XIAO's GND, and put 47–100 µF plus 100 nF across VCC/GND at the module.
+- **The MOSI line back-powers the module**: with the module's VCC disconnected, its PWR LED still lights, fed from MOSI through the MCP2515's input protection diode. Don't run it that way: check that VCC is really connected.
 - **D7 to Rs**: most SN65HVD230 modules tie Rs to GND. Cut that link, or remove the resistor, before connecting D7. Otherwise, driving D7 high shorts the pin. Details are under [Power](#power).
 - **No front pin left for UWB**: D0–D10 are all taken. The DW3000 will need CS, IRQ and RST on the back pads of the XIAO Plus (D11/P0.15, D12/P0.19 and D13/P1.01 are free), plus the shared SPI bus on D8/D9/D10. If you want UWB later, route those pads now, before the enclosure is closed. Power the module from 3V3: it draws 72 mA peaks from the same LDO as the rest of the unit.
 
@@ -117,7 +119,7 @@ The detector in [car/src/tap/](car/src/tap/) is a copy of [../tapDetector/src](.
 
 The car unit is built to idle at the lowest draw the radio allows. The onboard LED lights only for the ~0.7 s boot animation. The I2S clock runs only during an authenticated session. CAN reception is interrupt-driven, and the relay dwell sleeps on a semaphore instead of polling.
 
-**MCP2515 Sleep is disabled for now** (`MCP_SLEEP_ENABLED` 0 in [car/src/door_config.h](car/src/door_config.h)). On the current module the crystal doesn't restart after Sleep: a WAKIF wake sets CANCTRL REQOP to Listen-Only (`CANCTRL 67`), but CANSTAT stays at Sleep (`20`), and every mode change times out until a reset. Between sessions the chip now stays in Configuration mode (`can_stop()`), off the bus with its oscillator running, at a few mA. The text below describes the Sleep path, kept for a module whose crystal does restart.
+**MCP2515 Sleep is disabled for now** (`MCP_SLEEP_ENABLED` 0 in [car/src/door_config.h](car/src/door_config.h)). On the current module the crystal doesn't restart after Sleep (observed while the module ran from the XIAO's 3V3, so the weak supply may be the cause; retest with a dedicated regulator): a WAKIF wake sets CANCTRL REQOP to Listen-Only (`CANCTRL 67`), but CANSTAT stays at Sleep (`20`), and every mode change times out until a reset. Between sessions the chip now stays in Configuration mode (`can_stop()`), off the bus with its oscillator running, at a few mA. The text below describes the Sleep path, kept for a module whose crystal does restart.
 
 With Sleep enabled, the MCP2515 sleeps outside a fob session, at a few µA, with no hardware change. An SPI Bit Modify sets REQOP in CANCTRL to Sleep (`0x20`). WAKIE stays off while it sleeps, so bus traffic can't wake it. The first `door_send()` or OBD-II query of a session wakes it:
 1. Set WAKIE in CANINTE, then WAKIF in CANINTF, with Bit Modifies. Setting WAKIF without WAKIE leaves the chip asleep, and every later mode change times out (`Timeout trying to set MCP2515 operation mode`).
