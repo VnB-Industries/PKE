@@ -80,7 +80,9 @@ esp_err_t install_i2s() {
   cfg.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX);
   cfg.sample_rate = tap::kSampleRate;
   cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
-  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+  // INMP441 with L/R tied to GND transmits in the slot the ESP32 legacy I2S
+  // driver reads as RIGHT; ONLY_LEFT reads the empty slot (raw_max stuck at 1).
+  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT;
   cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   cfg.dma_buf_count = kDmaBufCount;
@@ -154,13 +156,9 @@ void handle_event(const tap::TapEvent& ev) {
   uint32_t since_tap = has_last_tap ? ev.onsetMs - last_tap_ms : UINT32_MAX;
   if (!reject) reject = tap::checkContext(ev.preActivityDb, since_tap, validator_config);
 
-  // Every event is logged, accepted or not, to refine thresholds later.
-  LOG_INF("EVT t=%lu floor=%.1f peak=%.1f rise=%.2f decay=%.0f crest=%.1f pre=%.1f "
-          "band=%.2f excl=%.2f cent=%.0f flat=%.2f sim=%.2f act=%.1f -> %s",
-          (unsigned long)ev.onsetMs, ev.floorDb, f.peakDbfs, f.riseMs, f.decayMs, f.crestDb,
-          f.preContrastDb, f.bandRatio, f.exclusionRatio, f.centroidHz, f.flatness,
-          f.similarity, ev.preActivityDb, reject ? reject : "TAP");
+  // Only recognized taps are logged.
   if (!reject) {
+    LOG_INF("TAP t=%lu peak=%.1f", (unsigned long)ev.onsetMs, f.peakDbfs);
     has_last_tap = true;
     last_tap_ms = ev.onsetMs;
     matcher.addTap(ev.onsetMs);
@@ -169,7 +167,6 @@ void handle_event(const tap::TapEvent& ev) {
 
 void handle_sequence(const tap::SequenceResult& seq) {
   if (!seq.match) {
-    LOG_INF("SEQ %u taps, no match", seq.tapCount);
     return;
   }
 

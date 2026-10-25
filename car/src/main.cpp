@@ -23,11 +23,15 @@
 LOG_MODULE("car");
 
 /* Step 2: unlock once the filtered advert RSSI holds this level. */
-#define DETECT_RSSI_DBM -70
-#define DETECT_SAMPLES  3
+#define DETECT_RSSI_DBM -82
+#define DETECT_SAMPLES  1
 
-/* Step 3: the exit starts once the filtered advert RSSI stays below this level. */
-#define EXIT_RSSI_DBM -80
+/*
+ * Step 3: the exit starts once the filtered advert RSSI stays below this level.
+ * Only 4 dB below DETECT, so the fob locks after a short walk away. A narrow
+ * dead band risks flapping at the boundary; EXIT_SAMPLES + the parked check guard it.
+ */
+#define EXIT_RSSI_DBM -86
 #define EXIT_SAMPLES  5
 /* The fob advertises every ~250 ms: this long without an advert means it is out of range. */
 #define FOB_LOST_MS 3000
@@ -37,7 +41,7 @@ LOG_MODULE("car");
  * the gap between DETECT_RSSI_DBM and EXIT_RSSI_DBM already keeps a fob at
  * the boundary from flapping between lock and unlock.
  */
-#define RETRY_DELAY_MS 2000
+#define RETRY_DELAY_MS 500
 
 /* Same as Zephyr's BT_GAP_SCAN_FAST_INTERVAL / BT_GAP_SCAN_FAST_WINDOW. */
 #define SCAN_INTERVAL_MS 60
@@ -52,10 +56,10 @@ struct scan_report {
 
 static QueueHandle_t adv_q;
 
-/* Exponential moving average, alpha = 1/4. */
+/* Exponential moving average, alpha = 1/2: reacts fast so a fob walking in is detected sooner. */
 static int rssi_filter(int ema, int sample, bool first)
 {
-	return first ? sample : ema + (sample - ema) / 4;
+	return first ? sample : ema + (sample - ema) / 2;
 }
 
 class ScanCallbacks : public NimBLEScanCallbacks {
@@ -112,6 +116,7 @@ static int wait_for_fob(void)
 	int ema = 0;
 	int above = 0;
 	bool first = true;
+	unsigned int samples = 0;
 
 	xQueueReset(adv_q);
 	LOG_INF("scanning for fob");
@@ -122,9 +127,12 @@ static int wait_for_fob(void)
 		first = false;
 		above = ema >= DETECT_RSSI_DBM ? above + 1 : 0;
 
-		LOG_INF("fob resolved %02X:%02X:%02X:%02X:%02X:%02X rssi=%d ema=%d", report.addr[5],
-			report.addr[4], report.addr[3], report.addr[2], report.addr[1], report.addr[0],
-			report.rssi, ema);
+		/* One advert per address arrives often; log every 4th to keep the line rate sane. */
+		if (++samples % 4 == 0) {
+			LOG_INF("fob resolved %02X:%02X:%02X:%02X:%02X:%02X rssi=%d ema=%d", report.addr[5],
+				report.addr[4], report.addr[3], report.addr[2], report.addr[1], report.addr[0],
+				report.rssi, ema);
+		}
 		if (above >= DETECT_SAMPLES) {
 			LOG_INF("fob detected");
 			return ema;
@@ -173,16 +181,20 @@ static void run_session(int rssi)
 	bool locked = false;
 	bool seen;
 
-	/* The mic only listens while the fob is detected. */
+	(void)rssi;
+
+	/*
+	 * Proximity only arms the session: the mic listens while the fob is detected and the
+	 * driver must double tap to unlock (tap_listener.cpp handle_sequence -> door_send).
+	 * No automatic unlock on approach.
+	 */
 	tap_listener_start();
 
-	if (unlock_decide(rssi)) {
-		/* A fob no longer heard is out of BLE range, so beyond any lock radius. */
-		do {
-			seen = wait_for_exit();
-			locked = lock_decide();
-		} while (!locked && seen);
-	}
+	/* A fob no longer heard is out of BLE range, so beyond any lock radius. */
+	do {
+		seen = wait_for_exit();
+		locked = lock_decide();
+	} while (!locked && seen);
 
 	tap_listener_stop();
 	door_sleep();
