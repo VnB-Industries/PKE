@@ -33,6 +33,11 @@ The earlier ESP32 Arduino firmware (tap-only, no BLE) is on the `ESP32/main` bra
 
 The pins are set in [car/app.overlay](car/app.overlay). Set `osc-freq` there to match the crystal on your MCP2515 module (8 MHz by default). A wrong value still starts, but frames won't ACK. The CAN bitrate is 500 kbit/s. The UWB module is not fitted yet.
 
+**Important notes before assembly:**
+
+- **D7 to Rs**: most SN65HVD230 modules tie Rs to GND. Cut that link, or remove the resistor, before connecting D7. Otherwise, driving D7 high shorts the pin. Details are under [Power](#power).
+- **No front pin left for UWB**: D0–D10 are all taken. The DW3000 will need CS, IRQ and RST on the back pads of the XIAO Plus (D11/P0.15, D12/P0.19 and D13/P1.01 are free), plus the shared SPI bus on D8/D9/D10. If you want UWB later, route those pads now, before the enclosure is closed. Power the module from 3V3: it draws 72 mA peaks from the same LDO as the rest of the unit.
+
 ## Hardware (fob)
 
 | Part | Role |
@@ -62,13 +67,13 @@ The pins are set in [fob/app.overlay](fob/app.overlay). The ADXL362 must stay po
 The fob has two power states:
 
 - **Carried**: the fob advertises every ~250 ms and answers the car. The DW3000 will be powered only during a car session, for the 3–5 ranging rounds, and kept off otherwise.
-- **At rest**: after 5 minutes without movement, the fob stops advertising and enters System OFF. Only the ADXL362 (~270 nA) and the nRF52840's wake logic stay powered. The next movement wakes it, and it boots and advertises again.
+- **At rest**: after 1 minute without movement, the fob stops advertising and enters System OFF. Only the ADXL362 (~270 nA) and the nRF52840's wake logic stay powered. The next movement wakes it, and it boots and advertises again. With a car connected, the fob waits twice as long at rest, then closes the link itself before powering off.
 
 Details are under [Power](#power).
 
 When the UWB3000F00 is fitted, it shares the SPI bus (D8/D9/D10) and needs its own CS, IRQ and RST pins. Feed it from the regulated 3V3 pin, never from BAT+: a charged cell (~4.2 V) is above its 3.6 V maximum.
 
-No LEDs are used, to keep consumption down. Everything is reported on the USB serial log.
+The onboard RGB LED is used only at boot: a ~0.7 s red-green-blue chase then a white flash ([common/boot_led.c](common/boot_led.c)), on both boards. Each wake from System OFF is a reboot, so it also marks every wake. The LED stays off otherwise, to keep consumption down. Everything else is reported on the USB serial log.
 
 ## Build & flash
 
@@ -90,10 +95,10 @@ No LEDs are used, to keep consumption down. Everything is reported on the USB se
 3. **Authenticated exchange**: the link is encrypted with LE Secure Connections Just Works, without bonding. On top of it, both sides prove they hold the secret with HMAC-SHA256 over two fresh nonces, then derive a session key with HKDF-SHA256. Both log the same `key id`, a hash prefix of the key, never the key itself.
 4. **Mic on**: the car starts the tap listener. It stops again when the session ends, whether by a lock or a lost link, and the MCP2515 goes back to Sleep.
 5. **UWB ranging**: dummy for now, and it always passes ([ranging.c](car/src/ranging.c)).
-6. **Unlock**: the car sends the unlock frame ([door.c](car/src/door.c)), with the relay wake if the bus is asleep. The session stays up even if delivery failed; a double tap retries it.
-7. **Exit detection**: the car polls the link RSSI every 250 ms. An exit starts when the filtered RSSI stays below -80 dBm for 5 samples. The vehicle precondition ([vehicle.c](car/src/vehicle.c)) is a stub that always returns true.
+6. **Unlock**: off for now (`AUTO_UNLOCK_ENABLED` 0 in [car/src/main.c](car/src/main.c)): the session skips this step, and the doors open with a double tap or the original key. When enabled, the car sends the unlock frame ([door.c](car/src/door.c)), with the relay wake if the bus is asleep. The session stays up even if delivery failed; a double tap retries it. While the car is being driven there is no automatic unlock, so a fob reconnecting mid-drive never opens the doors (see [Driving mode](#driving-mode)).
+7. **Exit detection**: the car polls the link RSSI every 250 ms. An exit starts when the filtered RSSI stays below -80 dBm for 5 samples. It only counts while the car is not being driven: the car polls the vehicle state over OBD-II once a second ([vehicle.c](car/src/vehicle.c)), and while driving it ignores the RSSI and slows the link (see [Driving mode](#driving-mode)).
 8. **UWB ranging session**: `RANGE_REQ` with a fresh nonce; both sides derive the STS key. The DS-TWR rounds are the dummy and pass.
-9. **Lock**: once `LOCK_K_ROUNDS` rounds are beyond the lock radius, the car sends the lock frame. A lost link counts as beyond the radius. The car then disconnects and scans again after 2 s; the 10 dB gap between the connect and exit thresholds stops it from flapping.
+9. **Lock**: once `LOCK_K_ROUNDS` rounds are beyond the lock radius, the car sends the lock frame. A lost link (supervision timeout) counts as beyond the radius. A link the fob closes itself (`0x13`, remote user terminated, sent when it goes to sleep at rest) does not lock: the doors stay as they are. The car then disconnects and scans again after 2 s; the 10 dB gap between the connect and exit thresholds stops it from flapping.
 
 BLE thresholds are `#define`s at the top of [car/src/main.c](car/src/main.c). Door frames, retries and relay timings are in [car/src/door_config.h](car/src/door_config.h).
 
@@ -110,12 +115,14 @@ The detector in [car/src/tap/](car/src/tap/) is a copy of [../tapDetector/src](.
 
 ### Power
 
-The car unit is built to idle at the lowest draw the radio allows. There are no LEDs. The I2S clock runs only during an authenticated session. CAN reception is interrupt-driven, and the relay dwell sleeps on a semaphore instead of polling.
+The car unit is built to idle at the lowest draw the radio allows. The onboard LED lights only for the ~0.7 s boot animation. The I2S clock runs only during an authenticated session. CAN reception is interrupt-driven, and the relay dwell sleeps on a semaphore instead of polling.
 
-The MCP2515 sleeps outside a fob session, at a few µA, with no hardware change. An SPI Bit Modify sets REQOP in CANCTRL to Sleep (`0x20`). WAKIE stays off, so bus traffic can't wake it. The first `door_send()` of a session wakes it:
-1. Set WAKIF in CANINTF with a Bit Modify.
+**MCP2515 Sleep is disabled for now** (`MCP_SLEEP_ENABLED` 0 in [car/src/door_config.h](car/src/door_config.h)). On the current module the crystal doesn't restart after Sleep: a WAKIF wake sets CANCTRL REQOP to Listen-Only (`CANCTRL 67`), but CANSTAT stays at Sleep (`20`), and every mode change times out until a reset. Between sessions the chip now stays in Configuration mode (`can_stop()`), off the bus with its oscillator running, at a few mA. The text below describes the Sleep path, kept for a module whose crystal does restart.
+
+With Sleep enabled, the MCP2515 sleeps outside a fob session, at a few µA, with no hardware change. An SPI Bit Modify sets REQOP in CANCTRL to Sleep (`0x20`). WAKIE stays off while it sleeps, so bus traffic can't wake it. The first `door_send()` or OBD-II query of a session wakes it:
+1. Set WAKIE in CANINTE, then WAKIF in CANINTF, with Bit Modifies. Setting WAKIF without WAKIE leaves the chip asleep, and every later mode change times out (`Timeout trying to set MCP2515 operation mode`).
 2. Wait 5 ms for the crystal to start.
-3. Clear WAKIF. The chip is now in Listen-Only mode.
+3. Clear WAKIF and WAKIE. The chip is now in Listen-Only mode.
 4. `can_start()` returns it to normal mode.
 5. Listen for up to 1.2 s, so the bus-awake check sees the bus as it is now.
 
@@ -145,7 +152,7 @@ If D6 is left unconnected, the pull-up holds it inactive. The unit never wakes o
 
 System OFF stops only the nRF52840. D7 keeps its level, so the transceiver stays in standby. The 12 V regulator's quiescent current and the transceiver's ~370 µA standby current set the unit's draw from then on.
 
-The fob sleeps when nobody carries it. The ADXL362 runs as a motion switch in wake-up mode (~270 nA), with INT1 high while the fob moves. After 5 minutes without an INT1 edge (`MOTION_IDLE_TIMEOUT_S` in [fob/src/motion.h](fob/src/motion.h)), the fob stops advertising and enters System OFF. It never sleeps during a car session or while INT1 is high. The next movement wakes it through INT1, and it reboots and starts advertising again. If the ADXL362 doesn't answer at boot, the fob logs an error and never sleeps, since nothing could wake it.
+The fob sleeps when nobody carries it. The ADXL362 runs as a motion switch in wake-up mode (~270 nA), with INT1 high while the fob moves. After 60 s without an INT1 edge (`MOTION_IDLE_TIMEOUT_S` in [fob/src/motion.h](fob/src/motion.h)), the fob stops advertising and enters System OFF. It never sleeps while INT1 is high. With a car connected it waits twice as long at rest, then closes the link itself (`0x13`, which the car does not treat as an exit) before sleeping. While the car reports it is being driven, it does not sleep at all. The next movement wakes it through INT1, and it reboots and starts advertising again. If the ADXL362 doesn't answer at boot, the fob logs an error and never sleeps, since nothing could wake it.
 
 The chip decides on its own when the fob is at rest ([fob/src/motion.c](fob/src/motion.c)). Movement is more than 250 mg away from its reference on any axis (`ACT_THRESHOLD_MG`). Rest is all axes within 150 mg of the reference (`INACT_THRESHOLD_MG`) for 30 consecutive samples (`INACT_SAMPLES`), ~5 s at the ~6 Hz wake-up rate. A single sample beyond 150 mg restarts that count. Each INT1 edge is logged:
 
@@ -175,6 +182,39 @@ At every boot, including each wake from System OFF, the fob logs the battery onc
 The BQ25101 charges the cell from USB-C on its own, so charging continues while the nRF52840 is in System OFF. The firmware leaves P0.13 (charge current: low 100 mA, high 50 mA) unconfigured, so the board's default applies.
 
 Fob battery budget: chip sleep is a few µA, BLE bursts are a few mA, and UWB ranging (once fitted) averages ~21 mA with 72 mA peaks. Battery life therefore depends on keeping UWB asleep except for brief ranging bursts. A CR2032 needs a 100–470 µF buffer cap near the UWB module. A LiPo must feed the UWB module from the regulated 3.3 V pin: a charged cell (~4.2 V) is above the UWB3000F00's 3.6 V maximum.
+
+## Driving mode
+
+During a session the car reads the vehicle state over OBD-II once a second ([car/src/vehicle.c](car/src/vehicle.c), requests in [car/src/vehicle_config.h](car/src/vehicle_config.h)):
+
+| State | Condition |
+| --- | --- |
+| off | no ECU answers, or the bus is quiet (nothing is transmitted then) |
+| driving | speed > 0, or in gear once the gear check is enabled; without it, speed 0 counts as driving for 10 s after the last motion, so a red light does not flip it |
+| parked | otherwise |
+
+A query only goes out when the bus has carried traffic in the last 2 s, so it never wakes a sleeping car. Three missed replies in a row are needed before a driven car counts as off.
+
+While driving:
+
+1. The car sends `DRIVE 1` to the fob while the link is still fast. The fob then stops its rest timer.
+2. The car switches the link to a 1 s interval with peripheral latency 4 and a 16 s supervision timeout. The fob's radio wakes every 5 s.
+3. The car ignores the link RSSI, so no exit can start.
+
+When the car stops being driven, the car restores the default link (30–50 ms) and then sends `DRIVE 0`. Exit detection resumes once both are done.
+
+Estimated fob current for the chip alone (board leakage comes on top): ~200 µA on the default link, ~5 µA on the driving link.
+
+### Signals
+
+- **Speed**: standard OBD-II, request `7DF 02 01 0D`, reply on `7E8`–`7EF` as `03 41 0D <km/h>`.
+- **Gear**: Toyota hybrid ECU, service `0x21` on `7E2`, reply on `7EA`. The PID, byte and P value for the CT200h are not verified, so `VEHICLE_GEAR_ENABLED` is 0.
+
+Verify both with [obd-tool](../obd-tool) `tx`, with the car in READY:
+
+1. Send `tx 7DF 02 01 0D 00 00 00 00 00` while stationary and while rolling. Expect `03 41 0D <km/h>` from `7E8`.
+2. Send `tx 7E2 02 21 <pid> 00 00 00 00 00` in P, R, N, D and B. Find the byte that changes with the shift position and its value in P.
+3. Fill in `GEAR_PID`, `GEAR_BYTE` and `GEAR_P_VALUE`, then set `VEHICLE_GEAR_ENABLED` to 1. Only a single-frame reply (first byte `0x0N`) is decoded. A multi-frame reply (first byte `0x1N`) needs ISO-TP flow control, which is not implemented.
 
 ## Waking a sleeping bus
 

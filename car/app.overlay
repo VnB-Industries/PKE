@@ -44,7 +44,8 @@
 	mcp2515: can@0 {
 		compatible = "microchip,mcp2515";
 		reg = <0>;
-		spi-max-frequency = <1000000>;
+		/* MCP2515 max is 10 MHz. At 1 MHz the driver can't drain a busy 500 kbit/s bus (RX0OVR). */
+		spi-max-frequency = <8000000>;
 		int-gpios = <&xiao_d 2 GPIO_ACTIVE_LOW>;
 		/* Check the crystal printed on the module: a wrong value still starts, but frames won't ACK. */
 		osc-freq = <8000000>;

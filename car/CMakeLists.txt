@@ -28,5 +28,6 @@ target_sources(app PRIVATE
   src/tap/pattern.cpp
   src/tap/tap_features.cpp
   ../common/pke_crypto.c
+  ../common/boot_led.c
 )
 target_include_directories(app PRIVATE ../common src/tap)

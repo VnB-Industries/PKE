@@ -17,6 +17,7 @@
 
 #include "actions.h"
 #include "auth_client.h"
+#include "boot_led.h"
 #include "car.h"
 #include "door.h"
 #include "pke_crypto.h"
@@ -37,6 +38,20 @@ LOG_MODULE_REGISTER(car, LOG_LEVEL_INF);
 #define EXIT_SAMPLES  5
 #define EXIT_POLL_MS  250
 
+/*
+ * Step 5: unlock as soon as the fob is authenticated. Off: the doors open with a double tap or the
+ * original key, and the session only watches for the exit and locks.
+ */
+#define AUTO_UNLOCK_ENABLED 0
+
+/* Driving mode: the vehicle state is read every this many exit polls, so once a second. */
+#define VEHICLE_POLL_EVERY 4
+/*
+ * Slow link while driving: 1 s interval, and the fob may skip 4 events, so it listens every 5 s.
+ * 16 s supervision timeout. Units: 1.25 ms for the interval, 10 ms for the timeout.
+ */
+#define DRIVE_CONN_PARAM BT_LE_CONN_PARAM(800, 800, 4, 1600)
+
 /* Step 7: rounds per ranging session, compared with the lock radius. */
 #define RANGING_ROUNDS 3
 #define LOCK_RADIUS_CM 300
@@ -52,6 +67,16 @@ LOG_MODULE_REGISTER(car, LOG_LEVEL_INF);
 /* Deep idle (power.h): listen this long, once per period, for the fob. */
 #define BURST_MS       1000
 #define BURST_PERIOD_S 60
+
+/* Why exit detection stopped watching the link. */
+enum exit_cause {
+	EXIT_WALKED_AWAY, /* link RSSI dropped with the car parked */
+	EXIT_LINK_LOST,   /* supervision timeout or any other loss: fob out of range */
+	EXIT_FOB_CLOSED,  /* the fob ended the link itself, e.g. to sleep at rest */
+};
+
+/* Reason of the last disconnection, set before EV_DISCONNECTED is posted. */
+static uint8_t disc_reason;
 
 struct adv_report {
 	bt_addr_le_t addr;
@@ -90,6 +115,7 @@ static void connected(struct bt_conn *c, uint8_t err)
 static void disconnected(struct bt_conn *c, uint8_t reason)
 {
 	LOG_INF("disconnected (reason 0x%02x)", reason);
+	disc_reason = reason;
 	k_event_post(&car_events, EV_DISCONNECTED);
 }
 
@@ -285,12 +311,42 @@ static int read_conn_rssi(int8_t *rssi)
 }
 
 /*
- * Step 6: polls the link RSSI until the driver walks away with the car parked.
- * Returns true on an exit, false when the link was lost first.
+ * Driving mode: a slow link the fob barely wakes for, and the fob told not to sleep at rest. The fob
+ * hears it while the link is fast: before slowing it, after speeding it up. Whatever fails is retried
+ * on the next vehicle poll.
  */
-static bool wait_for_exit(void)
+static void sync_driving(bool driving, bool *link_slow, bool *fob_told)
 {
+	if (driving && !*fob_told) {
+		*fob_told = auth_client_drive(conn, true) == 0;
+	}
+	if (driving != *link_slow) {
+		int err = bt_conn_le_param_update(conn, driving ? DRIVE_CONN_PARAM
+								: BT_LE_CONN_PARAM_DEFAULT);
+
+		if (err) {
+			LOG_WRN("conn param update failed (err %d)", err);
+		} else {
+			*link_slow = driving;
+			LOG_INF("%s link", driving ? "driving: slow" : "parked: fast");
+		}
+	}
+	if (!driving && *fob_told) {
+		*fob_told = auth_client_drive(conn, false) != 0;
+	}
+}
+
+/*
+ * Step 6: polls the link RSSI until the driver walks away with the car parked, or the link ends.
+ * While the car is driven, the RSSI is ignored and the link runs slow (sync_driving()).
+ */
+static enum exit_cause wait_for_exit(void)
+{
+	unsigned int ticks = 0;
 	unsigned int samples = 0;
+	bool driving = false;
+	bool link_slow = false;
+	bool fob_told = false;
 	bool read_failed = false;
 	int ema = 0;
 	int below = 0;
@@ -301,8 +357,26 @@ static bool wait_for_exit(void)
 		EXIT_SAMPLES);
 	for (;;) {
 		if (car_wait(0, K_MSEC(EXIT_POLL_MS))) {
+			/*
+			 * A clean terminate came from the fob over the encrypted link, so it was
+			 * still in range: nothing says the driver left.
+			 */
+			if (disc_reason == BT_HCI_ERR_REMOTE_USER_TERM_CONN) {
+				LOG_INF("fob closed the link while unlocked, not locking");
+				return EXIT_FOB_CLOSED;
+			}
 			LOG_WRN("link lost while unlocked, treating as exit");
-			return false;
+			return EXIT_LINK_LOST;
+		}
+		if (ticks++ % VEHICLE_POLL_EVERY == 0) {
+			driving = vehicle_poll() == VEHICLE_DRIVING;
+			sync_driving(driving, &link_slow, &fob_told);
+		}
+		if (driving || link_slow || fob_told) {
+			/* No exit while driven, nor before the link and the fob are back to parked. */
+			samples = 0;
+			below = 0;
+			continue;
 		}
 		err = read_conn_rssi(&rssi);
 		if (err) {
@@ -323,7 +397,7 @@ static bool wait_for_exit(void)
 
 		LOG_INF("exit started: link ema=%d dBm below %d dBm", ema, EXIT_RSSI_DBM);
 		if (vehicle_is_parked()) {
-			return true;
+			return EXIT_WALKED_AWAY;
 		}
 		below = 0;
 	}
@@ -359,10 +433,9 @@ static int ranging_session(const uint8_t session_key[PKE_KEY_LEN])
 static void run_session(const bt_addr_le_t *fob)
 {
 	uint8_t session_key[PKE_KEY_LEN];
-	uint32_t distance_cm;
+	enum exit_cause cause;
 	bool locked = false;
-	bool linked;
-	int err;
+	bool armed = true;
 
 	if (connect_secure(fob) || auth_client_run(conn, session_key)) {
 		return;
@@ -371,19 +444,34 @@ static void run_session(const bt_addr_le_t *fob)
 	/* The mic only listens while this authenticated fob is connected. */
 	tap_listener_start();
 
+#if AUTO_UNLOCK_ENABLED
+	uint32_t distance_cm;
 	/* Step 4 */
-	err = ranging_measure(session_key, &distance_cm);
+	int err = ranging_measure(session_key, &distance_cm);
 
-	/* Step 5 */
-	if (unlock_decide(pke_key_id(session_key), err ? -1 : (int32_t)distance_cm)) {
+	/* Step 5, never while driving: a fob reconnecting mid-drive must not open the doors. */
+	if (vehicle_poll() == VEHICLE_DRIVING) {
+		LOG_INF("car is being driven, unlock skipped");
+	} else {
+		armed = unlock_decide(pke_key_id(session_key), err ? -1 : (int32_t)distance_cm);
+	}
+#else
+	LOG_INF("auto-unlock off, double tap to unlock");
+#endif
+	if (armed) {
 		/*
 		 * Steps 6-8: stay connected so exit detection can read the link RSSI.
 		 * A lost link means the fob is out of BLE range, so beyond any lock radius.
+		 * A link the fob closed itself leaves the doors as they are.
 		 */
 		do {
-			linked = wait_for_exit();
-			locked = lock_decide(linked ? ranging_session(session_key) : LOCK_K_ROUNDS);
-		} while (!locked && linked);
+			cause = wait_for_exit();
+			if (cause == EXIT_FOB_CLOSED) {
+				break;
+			}
+			locked = lock_decide(cause == EXIT_WALKED_AWAY ? ranging_session(session_key)
+								 : LOCK_K_ROUNDS);
+		} while (!locked && cause == EXIT_WALKED_AWAY);
 	}
 
 	tap_listener_stop();
@@ -408,6 +496,7 @@ int main(void)
 	bt_addr_le_t fob;
 	int err;
 
+	boot_led_play();
 	err = pke_crypto_init();
 	if (!err) {
 		err = rpa_init();

@@ -3,6 +3,7 @@
 #define MOTION_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* No ADXL362 interrupt for this long puts the fob in System OFF. */
 #define MOTION_IDLE_TIMEOUT_S 60
@@ -17,6 +18,9 @@ int motion_init(void (*on_idle)(void));
 
 /* True while the ADXL362 reports the fob as moving (INT1 high). */
 bool motion_active(void);
+
+/* Milliseconds since the ADXL362 last changed state (started or stopped moving). */
+int64_t motion_rest_ms(void);
 
 /* Restarts the idle timer, for when the caller isn't ready to sleep yet. */
 void motion_defer(void);

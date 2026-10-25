@@ -13,6 +13,8 @@ LOG_MODULE_REGISTER(auth_client, LOG_LEVEL_INF);
 
 /* Budget for each exchange, measured once the link is encrypted. */
 #define EXCHANGE_TIMEOUT_MS 3000
+/* DRIVE may go out on the slow driving link, where the fob only listens every ~5 s. */
+#define DRIVE_TIMEOUT_MS 7000
 
 static const struct bt_uuid_128 auth_uuid = BT_UUID_INIT_128(PKE_AUTH_UUID_VAL);
 
@@ -267,4 +269,20 @@ int auth_client_range(struct bt_conn *conn, const uint8_t session_key[PKE_KEY_LE
 	}
 	LOG_INF("sts key id=%08x", pke_key_id(sts_key));
 	return 0;
+}
+
+int auth_client_drive(struct bt_conn *conn, bool driving)
+{
+	uint8_t req[PKE_DRIVE_LEN] = {PKE_MSG_DRIVE, driving};
+	int err;
+
+	deadline = k_uptime_get() + DRIVE_TIMEOUT_MS;
+	err = exchange(conn, req, sizeof(req), PKE_MSG_ACK, PKE_ACK_LEN);
+	if (!err && rx_buf[1] != PKE_STATUS_OK) {
+		err = -EACCES;
+	}
+	if (err) {
+		LOG_WRN("DRIVE %u not acknowledged (err %d)", driving, err);
+	}
+	return err;
 }

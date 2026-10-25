@@ -7,6 +7,9 @@
  *
  * One minute without motion (motion.c) stops advertising and puts the fob in
  * System OFF; the next movement wakes it, and it boots and advertises again.
+ * With a car connected the fob waits twice as long at rest, then disconnects
+ * cleanly before powering off. While the car reports it is being driven, the
+ * fob never sleeps: it stays linked on the slow link the car sets up.
  */
 #include <errno.h>
 #include <string.h>
@@ -20,6 +23,7 @@
 
 #include "keys.h"
 #include "battery.h"
+#include "boot_led.h"
 #include "motion.h"
 #include "pke_crypto.h"
 #include "pke_protocol.h"
@@ -28,6 +32,9 @@ LOG_MODULE_REGISTER(fob, LOG_LEVEL_INF);
 
 /* A car that has not finished mutual auth this long after connecting is dropped. */
 #define AUTH_TIMEOUT_MS 5000
+
+/* Rest needed to power off with a car connected, instead of MOTION_IDLE_TIMEOUT_S. */
+#define CONN_IDLE_TIMEOUT_S (2 * MOTION_IDLE_TIMEOUT_S)
 
 /* ~250 ms advertising interval, in 0.625 ms units. */
 #define ADV_INTERVAL_MIN 0x0190
@@ -65,6 +72,10 @@ K_MSGQ_DEFINE(fob_q, sizeof(struct fob_msg), 8, 4);
 static struct bt_conn *cur_conn;
 static enum fob_state state;
 static int64_t auth_deadline;
+/* Set when idleness dropped the link: System OFF follows the disconnect. */
+static bool poweroff_pending;
+/* Set by the car's DRIVE message: a fob at rest in a moving car keeps the link. */
+static bool driving;
 static uint8_t nonce_c[PKE_NONCE_LEN];
 static uint8_t nonce_f[PKE_NONCE_LEN];
 static uint8_t session_key[PKE_KEY_LEN];
@@ -238,6 +249,15 @@ static void on_range_req(const uint8_t *nonce_r)
 	memset(sts_key, 0, sizeof(sts_key));
 }
 
+static void on_drive(uint8_t on)
+{
+	uint8_t ack[PKE_ACK_LEN] = {PKE_MSG_ACK, PKE_STATUS_OK};
+
+	driving = on;
+	LOG_INF("car %s", driving ? "driving, sleep suspended" : "parked, sleep allowed");
+	notify(ack, sizeof(ack));
+}
+
 static void on_write(const uint8_t *data, uint8_t len)
 {
 	if (state == FOB_IDLE) {
@@ -251,6 +271,8 @@ static void on_write(const uint8_t *data, uint8_t len)
 	} else if (state == FOB_AUTHED && data[0] == PKE_MSG_RANGE_REQ &&
 		   len == PKE_RANGE_REQ_LEN) {
 		on_range_req(data + 1);
+	} else if (state == FOB_AUTHED && data[0] == PKE_MSG_DRIVE && len == PKE_DRIVE_LEN) {
+		on_drive(data[1]);
 	} else {
 		LOG_WRN("unexpected message 0x%02x (len %u) in state %d, dropping link", data[0],
 			len, state);
@@ -266,6 +288,7 @@ int main(void)
 	struct fob_msg msg;
 	int err;
 
+	boot_led_play();
 	err = pke_crypto_init();
 	if (err) {
 		LOG_ERR("crypto init failed (err %d)", err);
@@ -316,7 +339,12 @@ int main(void)
 			bt_conn_unref(cur_conn);
 			cur_conn = NULL;
 			state = FOB_IDLE;
+			driving = false;
 			memset(session_key, 0, sizeof(session_key));
+			if (poweroff_pending) {
+				bt_le_adv_stop();
+				motion_poweroff();
+			}
 			break;
 		case FOB_EV_RECYCLED:
 			advertise();
@@ -325,9 +353,21 @@ int main(void)
 			on_write(msg.data, msg.len);
 			break;
 		case FOB_EV_IDLE:
-			/* Never cut a live session, and a fob still moving isn't idle. */
-			if (cur_conn || motion_active()) {
+			/* A fob still moving isn't idle, and neither is one in a car being driven. */
+			if (motion_active() || driving) {
 				motion_defer();
+				break;
+			}
+			if (cur_conn) {
+				/* A live session gets a longer rest, then ends cleanly before sleeping. */
+				if (motion_rest_ms() < CONN_IDLE_TIMEOUT_S * MSEC_PER_SEC) {
+					motion_defer();
+					break;
+				}
+				LOG_INF("at rest for %d s with a car connected, disconnecting",
+					CONN_IDLE_TIMEOUT_S);
+				poweroff_pending = true;
+				drop_link();
 				break;
 			}
 			bt_le_adv_stop();

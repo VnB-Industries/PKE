@@ -24,6 +24,7 @@ enum pke_msg_type {
 	PKE_MSG_ACK = 0x04,       /* fob: status */
 	PKE_MSG_RANGE_REQ = 0x05, /* car: nonce_R, starts a UWB ranging session */
 	PKE_MSG_RANGE_ACK = 0x06, /* fob: status */
+	PKE_MSG_DRIVE = 0x07,     /* car: 1 while the car is driven, 0 once parked; fob answers ACK */
 };
 
 #define PKE_HELLO_LEN     (1 + PKE_NONCE_LEN)
@@ -32,6 +33,7 @@ enum pke_msg_type {
 #define PKE_ACK_LEN       2
 #define PKE_RANGE_REQ_LEN (1 + PKE_NONCE_LEN)
 #define PKE_RANGE_ACK_LEN 2
+#define PKE_DRIVE_LEN     2
 #define PKE_MSG_MAX_LEN   PKE_FOB_PROOF_LEN
 
 #define PKE_STATUS_OK   0x00

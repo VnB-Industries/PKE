@@ -59,6 +59,8 @@ static const struct gpio_dt_spec int1 = GPIO_DT_SPEC_GET(ADXL_NODE, int1_gpios);
 
 static struct gpio_callback int1_cb;
 static void (*idle_handler)(void);
+/* Uptime of the last INT1 edge, or of motion_init() before the first one. */
+static int64_t last_edge_ms;
 
 static void idle_expired(struct k_work *work)
 {
@@ -200,6 +202,7 @@ static void dump_expired(struct k_work *work)
 /* Both edges count: the fob starting to move, and coming to rest. */
 static void int1_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
+	last_edge_ms = k_uptime_get();
 	LOG_INF("ADXL362 INT1: %s", gpio_pin_get_dt(&int1) > 0 ? "moving" : "at rest");
 	k_work_reschedule(&dump_work, K_NO_WAIT);
 	k_work_reschedule(&idle_work, K_SECONDS(MOTION_IDLE_TIMEOUT_S));
@@ -231,6 +234,7 @@ int motion_init(void (*on_idle)(void))
 	}
 
 	idle_handler = on_idle;
+	last_edge_ms = k_uptime_get();
 	k_work_reschedule(&idle_work, K_SECONDS(MOTION_IDLE_TIMEOUT_S));
 	LOG_INF("ADXL362 motion switch on, System OFF after %d s at rest",
 		MOTION_IDLE_TIMEOUT_S);
@@ -242,6 +246,11 @@ bool motion_active(void)
 	return gpio_pin_get_dt(&int1) > 0;
 }
 
+int64_t motion_rest_ms(void)
+{
+	return k_uptime_get() - last_edge_ms;
+}
+
 void motion_defer(void)
 {
 	k_work_reschedule(&idle_work, K_SECONDS(MOTION_IDLE_TIMEOUT_S));
@@ -251,8 +260,7 @@ void motion_poweroff(void)
 {
 	/* A level interrupt sets the pin's SENSE, which is what wakes the chip from System OFF. */
 	gpio_pin_interrupt_configure_dt(&int1, GPIO_INT_LEVEL_ACTIVE);
-	LOG_INF("at rest for %d s, entering System OFF",
-		MOTION_IDLE_TIMEOUT_S);
+	LOG_INF("at rest for %lld s, entering System OFF", motion_rest_ms() / MSEC_PER_SEC);
 	LOG_PANIC();
 	sys_poweroff();
 }

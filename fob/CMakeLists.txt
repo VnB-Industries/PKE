@@ -19,5 +19,6 @@ target_sources(app PRIVATE
   src/motion.c
   src/battery.c
   ../common/pke_crypto.c
+  ../common/boot_led.c
 )
 target_include_directories(app PRIVATE ../common)

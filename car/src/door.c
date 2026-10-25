@@ -36,12 +36,19 @@ static K_MUTEX_DEFINE(door_mutex);
 static K_SEM_DEFINE(tx_sem, 0, 1);
 static K_SEM_DEFINE(reply_sem, 0, 1);
 static K_SEM_DEFINE(rx_sem, 0, 1);
+static K_SEM_DEFINE(query_sem, 0, 1);
 
 static bool can_ready;
 static bool mcp_asleep;
 static int filter_id = -1;
 static int tx_err;
 static uint8_t reply[4];
+/* door_query(): replies are captured from [query_id, query_id + query_span), span 0 when none is due. */
+static uint16_t query_id;
+static atomic_t query_span;
+/* Uptime before which door_query() refuses to send, 0 when no hold-off is running. */
+static uint32_t query_holdoff_until;
+static uint8_t query_rsp[8];
 
 /* Uptime of the last frame received from any other node; rx_seen stays 0 until the first one. */
 static atomic_t last_rx_ms;
@@ -58,6 +65,12 @@ static void rx_cb(const struct device *dev, struct can_frame *frame, void *user_
 	    frame->data[2] == 0x70) {
 		memcpy(reply, frame->data, sizeof(reply));
 		k_sem_give(&reply_sem);
+	}
+
+	if (frame->id - query_id < (uint32_t)atomic_get(&query_span)) {
+		memcpy(query_rsp, frame->data, MIN(can_dlc_to_bytes(frame->dlc), sizeof(query_rsp)));
+		atomic_set(&query_span, 0);
+		k_sem_give(&query_sem);
 	}
 }
 
@@ -138,8 +151,10 @@ static int mcp_read(uint8_t addr, uint8_t *value)
 
 /*
  * Puts the MCP2515 in Sleep mode, a few uA. can_stop() first aborts any pending frame and tells the
- * driver it is stopped. WAKIE stays off (the driver never sets it), so bus activity doesn't wake
- * the chip: only mcp_wake() does. Call with door_mutex held.
+ * driver it is stopped. WAKIE stays off outside mcp_wake(), so bus activity doesn't wake the chip.
+ * The chip only enters Sleep once the bus is idle, which can take longer than the check below, so it
+ * counts as asleep either way: mcp_wake() on a chip that is already awake does no harm, while a
+ * mode request to a sleeping chip times out. Call with door_mutex held.
  */
 static void mcp_sleep(void)
 {
@@ -147,6 +162,10 @@ static void mcp_sleep(void)
 
 	can_stop(can_dev);
 	can_ready = false;
+	if (!MCP_SLEEP_ENABLED) {
+		/* Configuration mode: off the bus, and the next start needs no wake. */
+		return;
+	}
 	mcp_bit_modify(MCP_ADDR_CANCTRL, MCP_MODE_MASK, MCP_MODE_SLEEP);
 	for (int i = 0; i < 10; i++) {
 		if (!mcp_read(MCP_ADDR_CANSTAT, &canstat) &&
@@ -157,24 +176,95 @@ static void mcp_sleep(void)
 		}
 		k_sleep(K_MSEC(1));
 	}
-	LOG_WRN("MCP2515 did not enter Sleep (CANSTAT 0x%02X)", canstat);
+	mcp_asleep = true;
+	LOG_WRN("MCP2515 Sleep not confirmed yet (CANSTAT 0x%02X)", canstat);
 }
 
 /*
- * Setting WAKIF by hand wakes the chip as bus activity would. It restarts its oscillator and comes up
- * in Listen-Only mode; can_start() then returns it to normal mode. Since nothing was received while
+ * Setting WAKIF by hand wakes the chip as bus activity would, but only with WAKIE set: without it the
+ * chip stays asleep and every mode request times out. WAKIE is on just for the wake, and the
+ * driver's interrupt handler clears the WAKIF interrupt it doesn't use. The chip restarts its
+ * oscillator and comes up in Listen-Only mode; can_start() then returns it to normal mode. Since nothing was received while
  * it slept, it listens for a moment so bus_awake() reflects the bus as it is now. Call with
  * door_mutex held.
  */
+/* The registers that say which mode the chip is in and why a mode change may stall. */
+static void mcp_dump(const char *when)
+{
+	uint8_t canstat = 0, canctrl = 0, inte = 0, intf = 0, eflg = 0, tec = 0;
+	uint8_t cnf1 = 0, cnf2 = 0, cnf3 = 0;
+
+	mcp_read(MCP_ADDR_CNF1, &cnf1);
+	mcp_read(MCP_ADDR_CNF2, &cnf2);
+	mcp_read(MCP_ADDR_CNF3, &cnf3);
+	mcp_read(MCP_ADDR_CANSTAT, &canstat);
+	mcp_read(MCP_ADDR_CANCTRL, &canctrl);
+	mcp_read(MCP_ADDR_CANINTE, &inte);
+	mcp_read(MCP_ADDR_CANINTF, &intf);
+	mcp_read(MCP_ADDR_EFLG, &eflg);
+	mcp_read(MCP_ADDR_TEC, &tec);
+	LOG_INF("MCP2515 %s: CANSTAT %02X CANCTRL %02X CANINTE %02X CANINTF %02X EFLG %02X TEC %u "
+		"CNF %02X %02X %02X", when, canstat, canctrl, inte, intf, eflg, tec, cnf1, cnf2, cnf3);
+}
+
+/*
+ * The driver writes CNF1-3 and CANINTE once, at init. A brown-out or reset of the MCP2515 alone
+ * zeroes them while the driver still believes the chip is configured: no interrupt ever fires, so
+ * nothing is received and every send times out, and the bitrate is wrong. CANINTE is never 0 once
+ * configured, so a 0 there means the chip lost its setup; setting the bitrate again rewrites it all.
+ * Call with door_mutex held, after the chip has been started.
+ */
+static void mcp_restore_config(void)
+{
+	uint8_t inte = 0;
+
+	if (mcp_read(MCP_ADDR_CANINTE, &inte) || inte != 0) {
+		return;
+	}
+	mcp_dump("lost its configuration");
+	/*
+	 * Not can_set_bitrate(): its default 87.5 % sample point is out of reach with the 8 MHz
+	 * crystal (8 TQ per bit at 500 kbit/s, PS2 >= 2), so it fails with -ERANGE. 75 % fits exactly.
+	 */
+	struct can_timing timing;
+	int stop_err = can_stop(can_dev);
+	int rate_err = can_calc_timing(can_dev, &timing, DT_PROP(DT_CHOSEN(zephyr_canbus), bitrate),
+				       CAN_SAMPLE_POINT_PERMILLE);
+
+	rate_err = rate_err < 0 ? rate_err : can_set_timing(can_dev, &timing);
+	if (!rate_err) {
+		/*
+		 * Zephyr always clears SAM; the ESP32 tool, which transmits fine on this bus with the
+		 * same module, samples each bit three times (mcp_can: CNF2 0xD1). Match it.
+		 */
+		mcp_bit_modify(MCP_ADDR_CNF2, MCP_CNF2_SAM, MCP_CNF2_SAM);
+	}
+	int start_err = rate_err ? 0 : can_start(can_dev);
+
+	if (rate_err || start_err) {
+		LOG_ERR("MCP2515 reconfiguration failed (stop %d, bitrate %d, start %d)", stop_err,
+			rate_err, start_err);
+		mcp_dump("after failed reconfiguration");
+		can_ready = false;
+		return;
+	}
+	LOG_WRN("MCP2515 reconfigured after a reset, listening for bus traffic...");
+	k_sem_reset(&rx_sem);
+	k_sem_take(&rx_sem, K_MSEC(CAN_WAKE_LISTEN_MS));
+}
+
 static void mcp_wake(void)
 {
+	mcp_bit_modify(MCP_ADDR_CANINTE, MCP_CANINTE_WAKIE, MCP_CANINTE_WAKIE);
 	mcp_bit_modify(MCP_ADDR_CANINTF, MCP_CANINTF_WAKIF, MCP_CANINTF_WAKIF);
 	k_sleep(K_MSEC(MCP_OSC_START_MS));
 	mcp_bit_modify(MCP_ADDR_CANINTF, MCP_CANINTF_WAKIF, 0);
+	mcp_bit_modify(MCP_ADDR_CANINTE, MCP_CANINTE_WAKIE, 0);
 	mcp_asleep = false;
 
 	if (can_start(can_dev)) {
 		LOG_ERR("MCP2515 wake failed");
+		mcp_dump("after failed start");
 		return;
 	}
 	can_ready = true;
@@ -183,9 +273,9 @@ static void mcp_wake(void)
 	k_sem_take(&rx_sem, K_MSEC(CAN_WAKE_LISTEN_MS));
 }
 
-static int send_frame(const uint8_t data[8])
+static int send_frame(uint16_t id, const uint8_t data[8])
 {
-	struct can_frame frame = {.id = DOOR_CMD_ID, .dlc = 8};
+	struct can_frame frame = {.id = id, .dlc = 8};
 	int err;
 
 	memcpy(frame.data, data, 8);
@@ -198,7 +288,17 @@ static int send_frame(const uint8_t data[8])
 		/*
 		 * Not ACKed. Left alone, the MCP2515 would keep retransmitting it and fire it the
 		 * instant the ECU wakes - a stale lock/unlock. Aborting it here prevents that.
+		 * TXBnCTRL first: TXREQ 0x08 still pending, TXERR 0x10 bus error (no ACK), MLOA 0x20
+		 * arbitration lost. Pending with neither means it never got a slot on the bus.
 		 */
+		uint8_t txb[3] = {0};
+
+		for (int i = 0; i < 3; i++) {
+			mcp_read(MCP_ADDR_TXB0CTRL + 0x10 * i, &txb[i]);
+		}
+		LOG_WRN("TX timeout: TXB0CTRL %02X TXB1CTRL %02X TXB2CTRL %02X", txb[0], txb[1],
+			txb[2]);
+		mcp_dump("at TX timeout");
 		restart_can();
 		return -ETIMEDOUT;
 	}
@@ -238,6 +338,7 @@ static bool relay_wake(void)
 		return true;
 	}
 	LOG_WRN("wake: no traffic after relay pulses; ECU may still be asleep");
+	mcp_dump("after failed wake");
 	return false;
 }
 #endif
@@ -255,7 +356,7 @@ static bool send_with_retries(const uint8_t *data)
 		int err;
 
 		k_sem_reset(&reply_sem);
-		err = send_frame(data);
+		err = send_frame(DOOR_CMD_ID, data);
 		if (!err) {
 			LOG_INF("sent OK (attempt %d)", attempt);
 			if (k_sem_take(&reply_sem, K_MSEC(DOOR_REPLY_WAIT_MS)) == 0) {
@@ -276,6 +377,7 @@ static bool send_with_retries(const uint8_t *data)
 	} else {
 		LOG_WRN("NOT delivered after retries: bus unresponsive");
 	}
+	mcp_dump("after failed send");
 	return false;
 }
 
@@ -295,19 +397,27 @@ bool door_send(enum door_cmd cmd)
 		LOG_WRN("CAN not ready, command dropped");
 		goto out;
 	}
+	mcp_restore_config();
+	if (!can_ready) {
+		goto out;
+	}
 
 	/*
-	 * Don't launch a door frame into a bus in deep sleep: nothing would ACK it. The NM frame
-	 * ticks ~1 Hz in the responsive window, so bus_awake() stays true there and the quiet-stretch
-	 * sends above still happen.
+	 * A silent bus is not necessarily a sleeping one (see send_with_retries()), so try the frame
+	 * first and only wake the ECU if it isn't delivered. Unanswered frames can't drive the
+	 * controller bus-off: ACK errors stop raising TEC once it is error-passive.
 	 */
 	if (!bus_awake()) {
+		LOG_INF("bus quiet, trying the frame anyway");
+		ok = send_with_retries(data);
+		if (ok) {
+			goto out;
+		}
+	}
+
+	if (!bus_awake()) {
 #if RELAY_WAKE_ENABLED
-		/*
-		 * Only unlock-on-return has to defeat deep sleep; lock happens in the responsive
-		 * window just after walking away, where the bus is still awake.
-		 */
-		if (cmd != DOOR_UNLOCK || !relay_wake()) {
+		if (!relay_wake()) {
 			LOG_WRN("bus in deep sleep, command dropped");
 			goto out;
 		}
@@ -353,4 +463,60 @@ void door_sleep(void)
 		mcp_sleep();
 	}
 	k_mutex_unlock(&door_mutex);
+}
+
+int door_query(uint16_t req_id, const uint8_t req[8], uint16_t rsp_id, uint8_t rsp_span,
+	       uint8_t rsp[8], k_timeout_t timeout)
+{
+	int err;
+
+	k_mutex_lock(&door_mutex, K_FOREVER);
+	if (mcp_asleep) {
+		mcp_wake();
+	}
+	if (!can_ready) {
+		can_ready = start_can() == 0;
+	}
+	if (!can_ready) {
+		err = -ENODEV;
+		goto out;
+	}
+	mcp_restore_config();
+	if (!can_ready) {
+		err = -ENODEV;
+		goto out;
+	}
+	/* A query never wakes the bus: only a door command is worth the relay. */
+	if (!bus_awake()) {
+		err = -ENETDOWN;
+		goto out;
+	}
+	/*
+	 * Queries are polled about once a second. While frames can't get out, every attempt drives
+	 * the controller bus-off and puts error frames on the car's bus, so hold off after a failure.
+	 */
+	if (query_holdoff_until && (int32_t)(k_uptime_get_32() - query_holdoff_until) < 0) {
+		err = -ENETDOWN;
+		goto out;
+	}
+
+	query_id = rsp_id;
+	memset(query_rsp, 0, sizeof(query_rsp));
+	k_sem_reset(&query_sem);
+	atomic_set(&query_span, rsp_span);
+	err = send_frame(req_id, req);
+	if (err == -ETIMEDOUT) {
+		query_holdoff_until = k_uptime_get_32() + QUERY_HOLDOFF_MS;
+		LOG_WRN("query frame not delivered, pausing queries for %d s", QUERY_HOLDOFF_MS / 1000);
+	}
+	if (!err && k_sem_take(&query_sem, timeout)) {
+		err = -ETIMEDOUT;
+	}
+	atomic_set(&query_span, 0);
+	if (!err) {
+		memcpy(rsp, query_rsp, sizeof(query_rsp));
+	}
+out:
+	k_mutex_unlock(&door_mutex);
+	return err;
 }
