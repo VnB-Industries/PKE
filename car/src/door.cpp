@@ -34,9 +34,8 @@ static SemaphoreHandle_t irq_sem;
 static SemaphoreHandle_t rx_sem;
 static SemaphoreHandle_t reply_sem;
 
-/* Written with mcp_mutex held, so the receive task never talks to a sleeping or absent chip. */
+/* Written with mcp_mutex held, so the receive task never talks to an absent chip. */
 static bool can_ready;
-static bool mcp_asleep;
 static uint8_t reply[4];
 
 /* millis() of the last frame received from any other node; rx_seen stays false until the first one. */
@@ -120,51 +119,6 @@ static bool start_can(void)
 	}
 	LOG_INF("MCP2515 on-bus");
 	return true;
-}
-
-/*
- * Puts the MCP2515 in Sleep mode, a few uA. WAKIE stays off (mcp_can leaves it off unless asked),
- * so bus activity doesn't wake the chip: only mcp_wake() does. Call with door_mutex held.
- */
-static void mcp_sleep(void)
-{
-	uint8_t err;
-
-	xSemaphoreTake(mcp_mutex, portMAX_DELAY);
-	can_ready = false;
-	err = can0.setMode(MCP_SLEEP);
-	xSemaphoreGive(mcp_mutex);
-	if (err != MCP2515_OK) {
-		LOG_WRN("MCP2515 did not enter Sleep");
-		return;
-	}
-	mcp_asleep = true;
-	LOG_INF("MCP2515 asleep");
-}
-
-/*
- * Leaving Sleep is done by mcp_can's setMode(): it sets WAKIF by hand, as bus activity would, waits
- * for the chip to restart its oscillator in Listen-Only mode, then switches it to normal mode. Since
- * nothing was received while it slept, it listens for a moment so bus_awake() reflects the bus as it
- * is now. Call with door_mutex held.
- */
-static void mcp_wake(void)
-{
-	uint8_t err;
-
-	xSemaphoreTake(mcp_mutex, portMAX_DELAY);
-	err = can0.setMode(MCP_NORMAL);
-	can_ready = err == MCP2515_OK;
-	xSemaphoreGive(mcp_mutex);
-	mcp_asleep = false;
-
-	if (err != MCP2515_OK) {
-		LOG_ERR("MCP2515 wake failed");
-		return;
-	}
-	LOG_INF("MCP2515 awake, listening for bus traffic...");
-	xSemaphoreTake(rx_sem, 0);
-	xSemaphoreTake(rx_sem, pdMS_TO_TICKS(CAN_WAKE_LISTEN_MS));
 }
 
 /* Returns CAN_OK, or the mcp_can error code (7 = CAN_SENDMSGTIMEOUT: not ACKed). */
@@ -281,9 +235,6 @@ bool door_send(enum door_cmd cmd)
 	bool ok = false;
 
 	xSemaphoreTake(door_mutex, portMAX_DELAY);
-	if (mcp_asleep) {
-		mcp_wake();
-	}
 	if (!can_ready) {
 		start_can();
 	}
@@ -336,21 +287,6 @@ int door_init(void)
 	attachInterrupt(digitalPinToInterrupt(MCP_INT_PIN), mcp_int_isr, FALLING);
 	xTaskCreatePinnedToCore(rx_task, "can_rx", RX_TASK_STACK, NULL, RX_TASK_PRIORITY, NULL, 1);
 
-	if (!start_can()) {
-		return -ENODEV;
-	}
-	/* No fob yet: the controller sleeps until the first command. */
-	xSemaphoreTake(door_mutex, portMAX_DELAY);
-	mcp_sleep();
-	xSemaphoreGive(door_mutex);
-	return 0;
-}
-
-void door_sleep(void)
-{
-	xSemaphoreTake(door_mutex, portMAX_DELAY);
-	if (!mcp_asleep) {
-		mcp_sleep();
-	}
-	xSemaphoreGive(door_mutex);
+	/* The controller stays on the bus from here on: the CAN module isn't power-managed. */
+	return start_can() ? 0 : -ENODEV;
 }
