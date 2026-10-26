@@ -58,16 +58,21 @@ Set `osc-freq` in the overlay to match the crystal on your MCP2515 module (8 MHz
 | ADXL362 accelerometer | motion switch: keeps the fob awake while it is carried, wakes it from System OFF |
 | UWB3000F00 (DW3000) | distance check; **not fitted yet** |
 
+On this branch the fob uses the **carte_uwb support board, fob variant** (rev C, `boitiers/3-voiture-legere-boutons-micro-nrf/carte_uwb/README.md` in the project files): the same board as the car unit, with the CAN P-MOS, relay, wake input and J2 left unfitted, the LiPo soldered to J3, and the ADXL362 on J1. The UWB side is wired exactly as on the car unit.
+
 | XIAO pin | Connects to |
 | --- | --- |
-| D0 | DW3000 CS (UWB, not fitted yet) |
-| D1 | ADXL362 CS |
-| D2 | ADXL362 INT1 (wakes the nRF52840 from System OFF) |
-| D3 | DW3000 IRQ (active high, internal pull-down) |
-| D4 | DW3000 RSTn (open drain: pulled low to reset, never driven high) |
-| D5 | DW3000 WAKEUP (optional) |
-| D8 / D9 / D10 | SCLK / MISO / MOSI, shared by the ADXL362 and the DW3000 |
-| 3V3 / GND | ADXL362 VS and VIO, UWB3000F00 |
+| D0 / D3 / D4 | DW3000 SCK / MOSI / MISO (SPIM3, its own bus) |
+| D1 | DW3000 RSTn (open drain: pulled low to reset, never driven high) |
+| D2 | DW3000 WAKEUP |
+| D5 | DW3000 CS |
+| D6 | DW3000 IRQ (active high, internal pull-down) |
+| D8 | ADXL362 CS (J1 pin 7) |
+| D9 | ADXL362 INT1 (J1 pin 5, wakes the nRF52840 from System OFF) |
+| D17 / D18 / D19 (bottom pads) | ADXL362 SCLK / MISO / MOSI (J1 pins 8 / 6 / 4) |
+| 3V3 / GND | ADXL362 VS and VIO (J1 pins 1 / 2), UWB3000F00 |
+| BAT+ / BAT− (J3) | LiPo, to the XIAO's VBAT bottom pad |
+| D7, D10, D14 | free on the fob |
 
 The XIAO also wires its charger to internal pins, which the firmware reads (from Seeed's schematic, not the Zephyr board files):
 
@@ -86,12 +91,9 @@ The fob has two power states:
 
 Details are under [Power](#power).
 
-When the UWB3000F00 is fitted, it shares the SPI bus (D8/D9/D10) with the ADXL362, with its own CS on D0. The ADXL362 keeps D1 and D2, which the earlier pin plan gave to the UWB: moving it would mean rewiring for nothing, and putting either chip on SPI1 (D17–D19) would mean soldering under the XIAO, so it could no longer lie flat on the battery. Sharing works because:
-- The DW3000 releases MISO whenever its CS is high (datasheet §4.9.1: "SPIMISO … go open-drain when SPICSn is de-asserted, to allow interoperation with other slaves"), and so does the ADXL362.
-- Both default to SPI mode 0, and each node has its own `spi-max-frequency` (ADXL362 1 MHz, DW3000 up to 38 MHz), which Zephyr applies per transaction.
-- The SPI driver drives every `cs-gpios` line inactive at boot, so D0 keeps the DW3000 deselected even before its driver exists, and the level holds in System OFF.
+The ADXL362 and the DW3000 are on separate SPI buses, as on the car unit: the board routes the UWB to D0–D6 and the J1 side (here the ADXL362) to D8/D9 and D17–D19. D17–D19 are bottom pads, which is fine here because the XIAO is reflowed onto the board. An earlier plan shared D8–D10 between both chips with the ADXL362 CS/INT1 on D1/D2; it was dropped so that the fob firmware follows the same board as the car unit.
 
-The DW3000 node in the overlay is `disabled` and uses a local binding ([fob/dts/bindings/qorvo,dw3000.yaml](fob/dts/bindings/qorvo,dw3000.yaml)) until the Qorvo driver is brought in. Before System OFF, the UWB code will have to put the DW3000 in DEEPSLEEP (~260 nA) with its IRQ in active-high mode, and keep it powered: an unpowered DW3000 on a shared bus would be back-fed through its I/O pins whenever the ADXL362 is read. Feed it from the regulated 3V3 pin, never from BAT+: a charged cell (~4.2 V) is above its 3.6 V maximum.
+The DW3000 node in the overlay is `disabled` and uses a local binding ([fob/dts/bindings/qorvo,dw3000.yaml](fob/dts/bindings/qorvo,dw3000.yaml)) until the Qorvo driver is brought in. Before System OFF, the UWB code will have to put the DW3000 in DEEPSLEEP (~260 nA) with its IRQ in active-high mode, and keep it powered: an unpowered DW3000 would be back-fed through its I/O pins. Feed it from the regulated 3V3 pin, never from BAT+: a charged cell (~4.2 V) is above its 3.6 V maximum.
 
 The onboard RGB LED is used only at boot: a ~0.7 s red-green-blue chase then a white flash ([common/boot_led.c](common/boot_led.c)), on both boards. Each wake from System OFF is a reboot, so it also marks every wake. The LED stays off otherwise, to keep consumption down. Everything else is reported on the USB serial log.
 
