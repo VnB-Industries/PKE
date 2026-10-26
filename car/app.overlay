@@ -4,7 +4,7 @@
  * revision:
  *   D0 DW3000 SCK     D1 DW3000 RSTn    D2 DW3000 WAKEUP   D3 DW3000 MOSI
  *   D4 DW3000 MISO    D5 DW3000 CS      D6 DW3000 IRQ
- *   D7 SN65HVD230 Rs (high = standby)   D8 MCP2515 CS      D9 MCP2515 INT    D10 relay
+ *   D7 CAN module power (P-MOS gate, low = on)   D8 MCP2515 CS   D9 MCP2515 INT   D10 relay
  *   D11/D12/D13 INMP441 SD/SCK/WS (bottom pads)
  *   D14 wake input (bottom pad, J1 pin 11)
  *   D17/D18/D19 MCP2515 SCK/MISO/MOSI (bottom pads)
@@ -16,15 +16,12 @@
 		zephyr,canbus = &mcp2515;
 	};
 
-	/* can_start() drives Rs low (high speed), can_stop() high (standby, ~370 uA). */
-	can_phy: can-phy {
-		compatible = "can-transceiver-gpio";
-		max-bitrate = <1000000>;
-		standby-gpios = <&xiao_d 7 GPIO_ACTIVE_HIGH>;
-		#phy-cells = <0>;
-	};
-
 	zephyr,user {
+		/*
+		 * Gate of the board's P-MOS (100k pull-up to 3.3 V): low powers the CAN module, high or
+		 * floating cuts it, also in System OFF. On only during a fob session (door.c).
+		 */
+		can-power-gpios = <&xiao_d 7 GPIO_ACTIVE_LOW>;
 		/* Energised = relay closed = jamb-switch line grounded = "driver's door open". */
 		relay-gpios = <&xiao_d 10 GPIO_ACTIVE_HIGH>;
 		/* D14 (P0.09). Low = wake: brings the unit back from deep idle or System OFF (power.c). */
@@ -37,7 +34,7 @@
 	nfct-pins-as-gpios;
 };
 
-/* D6/D7 carry the UWB IRQ and CAN Rs: the console is the USB serial port, not this UART. */
+/* D6/D7 carry the UWB IRQ and the CAN power switch: the console is the USB serial port, not this UART. */
 &uart0 {
 	status = "disabled";
 };
@@ -65,7 +62,6 @@
 		/* Check the crystal printed on the module: a wrong value still starts, but frames won't ACK. */
 		osc-freq = <8000000>;
 		bitrate = <500000>;
-		phys = <&can_phy>;
 		status = "okay";
 	};
 };

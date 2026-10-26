@@ -29,7 +29,7 @@ This branch (`nrf52840/UWB`) targets the car unit on the **carte_uwb support boa
 | D4 | P0.04 | DW3000 MISO | on board |
 | D5 | P0.05 | DW3000 CS | on board |
 | D6 | P1.11 | DW3000 IRQ (active high, internal pull-down) | on board |
-| D7 | P1.12 | SN65HVD230 Rs (standby control) | J1 pin 9 |
+| D7 | P1.12 | gate of the P-MOS that switches the CAN module's 3.3 V (low = on) | on board; switched 3.3 V on J1 pin 9 |
 | D8 | P1.13 | MCP2515 CS | J1 pin 7 |
 | D9 | P1.14 | MCP2515 INT (required by the Zephyr driver) | J1 pin 5 |
 | D10 | P1.15 | relay coil driver | J1 pin 3 |
@@ -45,8 +45,8 @@ Set `osc-freq` in the overlay to match the crystal on your MCP2515 module (8 MHz
 **Important notes before assembly:**
 
 - **Don't power the CAN module from the XIAO's 3V3 pin**: the XIAO's regulator holds 3.3 V at rest, but it can't deliver the SN65HVD230's current bursts when it transmits. Measured on the car: from the XIAO's 3V3, every transmitted frame failed with bit errors (`TXB0CTRL 18`) and the MCP2515 went bus-off, while receiving still worked. The same module powered from another 3.3 V supply transmitted fine with the same XIAO and firmware. The weak supply also left the MCP2515 unconfigured at boot (`CNF 00 00 00`, `CANINTE 00`), which the firmware now detects and repairs (`mcp_restore_config()` in [car/src/door.c](car/src/door.c)). Feed the module from its own 3.3 V regulator (e.g. an MCP1700 or AMS1117-3.3), with its GND tied to the XIAO's GND, and put 47–100 µF plus 100 nF across VCC/GND at the module.
-- **The MOSI line back-powers the module**: with the module's VCC disconnected, its PWR LED still lights, fed from MOSI through the MCP2515's input protection diode. Don't run it that way: check that VCC is really connected.
-- **D7 to Rs**: most SN65HVD230 modules tie Rs to GND. Cut that link, or remove the resistor, before connecting D7. Otherwise, driving D7 high shorts the pin. Details are under [Power](#power).
+- **The MOSI line back-powers the module**: with the module's VCC disconnected, its PWR LED still lights, fed from MOSI through the MCP2515's input protection diode. The firmware releases the CAN SPI pins, CS and INT before it cuts the module's supply (see [Power](#power)); when wiring, check that the module's VCC really comes from J1 pin 9.
+- **Leave the module's Rs as it is**: the SN65HVD230 stays in high-speed mode with Rs tied to GND, as most modules ship. Its supply is cut instead, so no standby control is needed.
 - **The SPI to the MCP2515 runs down the J1 cable** to the OBD box, at 8 MHz. Keep the cable short; if frames come back corrupt, lower `spi-max-frequency` in [car/app.overlay](car/app.overlay).
 
 ## Hardware (fob)
@@ -113,7 +113,7 @@ The onboard RGB LED is used only at boot: a ~0.7 s red-green-blue chase then a w
 1. **Enrollment**: `scripts/gen_keys.py` creates the shared secret, the fob IRK and the fob static identity address. They are compiled into both firmwares.
 2. **Discovery**: the fob's RPA rotates every 60 s (`CONFIG_BT_RPA_TIMEOUT`, short for testing). The car resolves it on the host with AES-ECB. It connects once the filtered advert RSSI holds -70 dBm for 3 samples.
 3. **Authenticated exchange**: the link is encrypted with LE Secure Connections Just Works, without bonding. On top of it, both sides prove they hold the secret with HMAC-SHA256 over two fresh nonces, then derive a session key with HKDF-SHA256. Both log the same `key id`, a hash prefix of the key, never the key itself.
-4. **Mic on**: the car starts the tap listener. It stops again when the session ends, whether by a lock or a lost link, and the MCP2515 goes back to Sleep.
+4. **Mic on**: the car starts the tap listener. It stops again when the session ends, whether by a lock or a lost link, and the CAN module is powered off.
 5. **UWB ranging**: dummy for now, and it always passes ([ranging.c](car/src/ranging.c)).
 6. **Unlock**: off for now (`AUTO_UNLOCK_ENABLED` 0 in [car/src/main.c](car/src/main.c)): the session skips this step, and the doors open with a double tap or the original key. When enabled, the car sends the unlock frame ([door.c](car/src/door.c)), with the relay wake if the bus is asleep. The session stays up even if delivery failed; a double tap retries it. While the car is being driven there is no automatic unlock, so a fob reconnecting mid-drive never opens the doors (see [Driving mode](#driving-mode)).
 7. **Exit detection**: the car polls the link RSSI every 250 ms. An exit starts when the filtered RSSI stays below -80 dBm for 5 samples. It only counts while the car is not being driven: the car polls the vehicle state over OBD-II once a second ([vehicle.c](car/src/vehicle.c)), and while driving it ignores the RSSI and slows the link (see [Driving mode](#driving-mode)).
@@ -137,22 +137,13 @@ The detector in [car/src/tap/](car/src/tap/) is a copy of [../tapDetector/src](.
 
 The car unit is built to idle at the lowest draw the radio allows. The onboard LED lights only for the ~0.7 s boot animation. The I2S clock runs only during an authenticated session. CAN reception is interrupt-driven, and the relay dwell sleeps on a semaphore instead of polling.
 
-**MCP2515 Sleep is disabled for now** (`MCP_SLEEP_ENABLED` 0 in [car/src/door_config.h](car/src/door_config.h)). On the current module the crystal doesn't restart after Sleep (observed while the module ran from the XIAO's 3V3, so the weak supply may be the cause; retest with a dedicated regulator): a WAKIF wake sets CANCTRL REQOP to Listen-Only (`CANCTRL 67`), but CANSTAT stays at Sleep (`20`), and every mode change times out until a reset. Between sessions the chip now stays in Configuration mode (`can_stop()`), off the bus with its oscillator running, at a few mA. The text below describes the Sleep path, kept for a module whose crystal does restart.
+**The CAN module is powered only during a fob session.** A P-MOS on the carte_uwb board (AO3401A, gate on D7 with a 100 kΩ pull-up to 3.3 V) switches the module's 3.3 V, which leaves J1 on pin 9. Outside a session the module draws nothing: no Sleep mode and no Rs standby, so the MCP2515 crystal that didn't restart after Sleep no longer matters, and the module needs no change. Unpowered, the SN65HVD230 leaves the bus alone, and the unit doesn't ACK, the same as an empty OBD port.
 
-With Sleep enabled, the MCP2515 sleeps outside a fob session, at a few µA, with no hardware change. An SPI Bit Modify sets REQOP in CANCTRL to Sleep (`0x20`). WAKIE stays off while it sleeps, so bus traffic can't wake it. The first `door_send()` or OBD-II query of a session wakes it:
-1. Set WAKIE in CANINTE, then WAKIF in CANINTF, with Bit Modifies. Setting WAKIF without WAKIE leaves the chip asleep, and every later mode change times out (`Timeout trying to set MCP2515 operation mode`).
-2. Wait 5 ms for the crystal to start.
-3. Clear WAKIF and WAKIE. The chip is now in Listen-Only mode.
-4. `can_start()` returns it to normal mode.
-5. Listen for up to 1.2 s, so the bus-awake check sees the bus as it is now.
+- **At boot** a `SYS_INIT` hook ([car/src/door.c](car/src/door.c)) powers the module before the MCP2515 driver resets and configures it. `door_init()` then checks the controller and powers it off.
+- **The first `door_send()` or OBD-II query of a session** powers it up (`mcp_power_on()`): D7 low, 10 ms for the supply and the power-on reset, the SPI pins restored, an SPI reset, then the bitrate, CANINTE and receive buffers written again (`mcp_configure()`, the same path that repairs a chip that lost its setup) and `can_start()`. It then listens for up to 1.2 s, so the bus-awake check sees the bus as it is now. That adds up to ~1.2 s to the first command or query of a session.
+- **At the end of the session**, `door_sleep()` powers it off (`mcp_power_off()`): `can_stop()`, then INT and CS set as disconnected inputs and the SPI suspended (`CONFIG_PM_DEVICE`), so SCK and MOSI become disconnected inputs too. Otherwise CS, which idles high, or MOSI would back-power the module through its input protection diodes. D7 then goes high.
 
-That adds up to ~1.2 s to the first unlock of a session. At the end of the session, `door_sleep()` puts it back to sleep. While asleep it doesn't ACK, the same as an empty OBD port.
-
-The SN65HVD230 transceiver goes to standby with the MCP2515. D7 drives its Rs pin through a `can-transceiver-gpio` PHY in [car/app.overlay](car/app.overlay). `can_start()` drives Rs low (high-speed mode), and `can_stop()`, which `mcp_sleep()` calls, drives it high (standby). Standby draws ~370 µA instead of the ~10 mA of high-speed mode (datasheet values, to be measured). Its receiver stays on as a bus monitor, and no firmware code beyond the overlay is involved.
-
-Most SN65HVD230 modules tie Rs to GND on the board, either directly or through a resistor. Check yours before wiring D7:
-- **Tied directly to GND**: cut that link first. Otherwise, driving D7 high shorts the pin.
-- **Through a resistor**: remove it. If it stays, it draws 3.3 V / R from D7 for as long as the transceiver is in standby: 330 µA with 10 kΩ.
+D7 stays high in System OFF, and the pull-up keeps the module off while the nRF52840 boots or is being flashed.
 
 Long parking is handled in three stages, counted from the end of the last fob session ([car/src/power.h](car/src/power.h)):
 
@@ -162,21 +153,15 @@ Long parking is handled in three stages, counted from the end of the last fob se
 | 2 to 4 days | deep idle: 1 s of scanning every 60 s (~1.7% duty) | within ~60 s |
 | over 4 days | System OFF: radio and CPU stopped | only after the wake input |
 
-In deep idle, hearing the fob at any RSSI returns the unit to normal scanning, and so does a press of the wake input. In System OFF, the wake input or CAN bus activity reboots the unit, which then scans normally. The idle clock restarts at every boot, so after a reflash or a replug the stages start from zero.
+In deep idle, hearing the fob at any RSSI returns the unit to normal scanning, and so does a press of the wake input. In System OFF, only the wake input reboots the unit, which then scans normally. The idle clock restarts at every boot, so after a reflash or a replug the stages start from zero.
 
 The wake input is D14 (P0.09, J1 pin 11), active low with the internal pull-up. Two sources can share it:
 - A push button to GND, hidden somewhere reachable from inside the car.
 - The driver's jamb-switch line, through a diode with its cathode on the line (a Schottky such as a BAT54). Opening the door grounds the line, which pulls D14 low. When the door is closed, the diode blocks the line's battery voltage. After System OFF, the driver opens the car once with the original key, and PKE works again from the next approach.
 
-**CAN bus activity also wakes the unit from System OFF** (`BUS_WAKE_ENABLED` in [car/src/door.h](car/src/door.h)). This is the reverse of the relay wake below: the car wakes the unit, not the unit the car. Opening the car with the key or the original remote, or opening a door, brings the bus up, and the gateway's NM frame then ticks on the OBD segment (see "Deep sleep is real"). Just before System OFF, `door_arm_bus_wake()` makes the MCP2515 pull INT low on the first bus activity, and gives its INT pin SENSE, the same way as the wake input:
-- With Sleep off (`MCP_SLEEP_ENABLED 0`, the default, since this module's crystal doesn't restart after Sleep), the chip is started in Listen-Only mode, which never ACKs or transmits. The first standard frame raises the receive interrupt the driver enabled at init. The transceiver is then put back in standby, where its receiver stays on. This draws a few mA, about what Configuration mode already draws between sessions.
-- With Sleep on, the chip sleeps with WAKIE set, and bus activity sets WAKIF.
+**CAN bus activity can't wake the unit from System OFF**: the CAN module is unpowered outside a session. The wake input is the only way back, so keep it wired. If D14 is left unconnected, the pull-up holds it inactive, and the unit never wakes on its own, so after 4 days it stays off until it is unplugged and plugged back in. If the wake input fails to set up at boot, the unit stops at deep idle instead.
 
-Either way, INT low reboots the nRF52840, and the driver resets the MCP2515 at boot. This needs no hardware change. If it works on the car (test in [tests/](tests/)), the hidden button and the jamb-switch diode become unnecessary. Until then, keep the wake input wired.
-
-If the MCP2515 fails to start at boot, only the wake input can wake the unit. If D14 is also left unconnected, the pull-up holds it inactive, and the unit never wakes on its own, so after 4 days it stays off until it is unplugged and plugged back in. If neither the wake input nor the CAN bus can wake it, the unit stops at deep idle instead.
-
-System OFF stops only the nRF52840. D7 keeps its level, so the transceiver stays in standby, its receiver still listening for the bus wake. The 12 V regulator's quiescent current and the transceiver's ~370 µA standby current set the unit's draw from then on.
+System OFF stops only the nRF52840. D7 keeps its level, so the CAN module stays unpowered. The 12 V regulator's quiescent current then sets most of the unit's draw.
 
 The fob sleeps when nobody carries it. The ADXL362 runs as a motion switch in wake-up mode (~270 nA), with INT1 high while the fob moves. After 60 s without an INT1 edge (`MOTION_IDLE_TIMEOUT_S` in [fob/src/motion.h](fob/src/motion.h)), the fob stops advertising and enters System OFF. It never sleeps while INT1 is high. With a car connected it waits twice as long at rest, then closes the link itself (`0x13`, which the car does not treat as an exit) before sleeping. While the car reports it is being driven, it does not sleep at all. The next movement wakes it through INT1, and it reboots and starts advertising again. If the ADXL362 doesn't answer at boot, the fob logs an error and never sleeps, since nothing could wake it.
 

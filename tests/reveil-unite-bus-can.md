@@ -1,5 +1,7 @@
 # Protocole de test — réveil de l'unité voiture par le bus CAN
 
+> **Abandonné le 26/10 sur `nrf52840/UWB`.** Le module CAN n'est plus alimenté hors session BLE (P-MOS sur D7) : le bus ne peut plus réveiller l'unité, et `door_arm_bus_wake()` a été retiré. Seule l'entrée de réveil D14 sort l'unité du System OFF. Ce protocole est gardé pour mémoire.
+
 **Véhicule :** Lexus CT200h 2018 · **Cible :** vérifier que l'activité du bus CAN de la prise OBD sort l'unité voiture du System OFF, pour se passer du bouton caché et de la diode sur le contacteur de montant.
 
 ## Principe

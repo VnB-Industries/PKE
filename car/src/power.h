@@ -21,13 +21,11 @@ enum power_stage {
 };
 
 /*
- * Sets up the wake input and starts the idle clock. can_ok says the MCP2515
- * came up, so CAN bus activity can also wake the unit (BUS_WAKE_ENABLED).
- * Returns 0, or a negative errno if the input is missing. The unit then relies
- * on the CAN bus alone, or stops at POWER_DEEP_IDLE if that is unavailable too,
- * since nothing could bring it back from System OFF.
+ * Sets up the wake input and starts the idle clock. Returns 0, or a negative
+ * errno if the input is missing. The unit then stops at POWER_DEEP_IDLE, since
+ * nothing could bring it back from System OFF.
  */
-int power_init(bool can_ok);
+int power_init(void);
 
 /* Restarts the idle clock: a fob session ran, or the fob was heard nearby. */
 void power_note_activity(void);
@@ -42,8 +40,8 @@ k_timeout_t power_until_deep_idle(void);
 bool power_wait_wake(k_timeout_t timeout);
 
 /*
- * Enters System OFF; the wake input going active, or CAN bus activity, wakes the unit, which then
- * reboots. Returns only if nothing could wake it: it then stays at POWER_DEEP_IDLE.
+ * Enters System OFF; the wake input going active wakes the unit, which then reboots. Returns only if
+ * the wake input is missing: the unit then stays at POWER_DEEP_IDLE.
  */
 void power_off(void);
 

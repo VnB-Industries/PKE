@@ -506,9 +506,9 @@ int main(void)
 		return 0;
 	}
 	/* Neither is fatal: BLE still runs, and door_send() retries the CAN start. */
-	err = door_init();
+	door_init();
 	tap_listener_init();
-	err = power_init(err == 0);
+	err = power_init();
 	if (err) {
 		LOG_ERR("wake input init failed (err %d)", err);
 	}

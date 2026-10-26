@@ -36,17 +36,12 @@ static const uint8_t UNLOCK_CMD_DATA[8] = {0x40, 0x05, 0x30, 0x11, 0x00, 0x40, 0
 /* After a query frame that couldn't be delivered, door_query() refuses to send for this long. */
 #define QUERY_HOLDOFF_MS 30000
 
-/* ---- MCP2515 Sleep mode (door_sleep()) ---- */
+/* ---- CAN module power (door_sleep()) ---- */
 /*
- * Off: on this module the MCP2515's crystal doesn't restart after Sleep. A WAKIF wake sets REQOP to
- * Listen-Only, but CANSTAT stays in Sleep and no mode change completes until a reset. Between
- * sessions the chip stays in Configuration mode instead (can_stop(), oscillator running, a few mA).
+ * Outside a fob session the P-MOS on D7 cuts the module's supply (can-power-gpios). Register values
+ * are from the MCP2515 datasheet; the Zephyr driver keeps its own copies private.
  */
-#define MCP_SLEEP_ENABLED 0
-/*
- * Outside a fob session the MCP2515 sleeps at a few uA. Register values are from the MCP2515
- * datasheet; the Zephyr driver keeps its own copies private.
- */
+#define MCP_OPCODE_RESET      0xC0
 #define MCP_OPCODE_READ       0x03
 #define MCP_OPCODE_BIT_MODIFY 0x05
 #define MCP_ADDR_CANSTAT      0x0E
@@ -59,14 +54,18 @@ static const uint8_t UNLOCK_CMD_DATA[8] = {0x40, 0x05, 0x30, 0x11, 0x00, 0x40, 0
 #define MCP_ADDR_CANINTE      0x2B
 #define MCP_ADDR_CANINTF      0x2C
 #define MCP_MODE_MASK         0xE0 /* CANCTRL.REQOP / CANSTAT.OPMOD */
-#define MCP_MODE_SLEEP        0x20
 #define MCP_ADDR_EFLG         0x2D
 #define MCP_ADDR_TEC          0x1C
-#define MCP_CANINTF_WAKIF     0x40
-#define MCP_CANINTE_WAKIE     0x40
-#define MCP_OSC_START_MS      5    /* crystal start-up after WAKIF, before talking to the chip */
+#define MCP_OSC_START_MS      5    /* crystal start-up after a reset, before talking to the chip */
 /*
- * After a wake the chip has missed everything, so listen this long before judging the bus. The
+ * Supply rise (~1 ms with the board's 100 nF gate capacitor), the module's decoupling and the
+ * MCP2515's power-on reset, before the first SPI transfer.
+ */
+#define MCP_POWER_UP_MS       10
+/* Powers the module at boot after the GPIO drivers (40) and before the MCP2515 driver (80). */
+#define CAN_POWER_INIT_PRIORITY 60
+/*
+ * After power-up the chip has missed everything, so listen this long before judging the bus. The
  * gateway's NM frame ticks ~1 Hz while the bus is responsive.
  */
 #define CAN_WAKE_LISTEN_MS    1200

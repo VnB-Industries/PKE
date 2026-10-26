@@ -13,11 +13,12 @@
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/can.h>
-#include <zephyr/drivers/can/transceiver.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/spi.h>
+#include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/pm/device.h>
 #include <zephyr/sys/atomic.h>
 
 #include "door.h"
@@ -26,15 +27,12 @@
 LOG_MODULE_REGISTER(door, LOG_LEVEL_INF);
 
 static const struct device *const can_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbus));
-/* Raw access to the same chip, for the Sleep mode the Zephyr driver doesn't offer. */
+/* Raw access to the same chip, for the reset and register reads the Zephyr driver doesn't offer. */
 static const struct spi_dt_spec mcp_spi =
 	SPI_DT_SPEC_GET(DT_CHOSEN(zephyr_canbus), SPI_OP_MODE_MASTER | SPI_WORD_SET(8));
-#if BUS_WAKE_ENABLED
 static const struct gpio_dt_spec can_int = GPIO_DT_SPEC_GET(DT_CHOSEN(zephyr_canbus), int_gpios);
-#if !MCP_SLEEP_ENABLED
-static const struct device *const can_phy = DEVICE_DT_GET(DT_PHANDLE(DT_CHOSEN(zephyr_canbus), phys));
-#endif
-#endif
+/* Active = the P-MOS conducts and the CAN module is powered. */
+static const struct gpio_dt_spec can_power = GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), can_power_gpios);
 #if RELAY_WAKE_ENABLED
 static const struct gpio_dt_spec relay = GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), relay_gpios);
 #endif
@@ -46,7 +44,8 @@ static K_SEM_DEFINE(rx_sem, 0, 1);
 static K_SEM_DEFINE(query_sem, 0, 1);
 
 static bool can_ready;
-static bool mcp_asleep;
+/* The module is powered at boot for the driver's init, then only during a fob session. */
+static bool mcp_powered = true;
 static int filter_id = -1;
 static int tx_err;
 static uint8_t reply[4];
@@ -156,46 +155,6 @@ static int mcp_read(uint8_t addr, uint8_t *value)
 	return err;
 }
 
-/*
- * Puts the MCP2515 in Sleep mode, a few uA. can_stop() first aborts any pending frame and tells the
- * driver it is stopped. WAKIE stays off outside mcp_wake() and door_arm_bus_wake(), so bus activity
- * doesn't wake the chip.
- * The chip only enters Sleep once the bus is idle, which can take longer than the check below, so it
- * counts as asleep either way: mcp_wake() on a chip that is already awake does no harm, while a
- * mode request to a sleeping chip times out. Call with door_mutex held.
- */
-static void mcp_sleep(void)
-{
-	uint8_t canstat = 0;
-
-	can_stop(can_dev);
-	can_ready = false;
-	if (!MCP_SLEEP_ENABLED) {
-		/* Configuration mode: off the bus, and the next start needs no wake. */
-		return;
-	}
-	mcp_bit_modify(MCP_ADDR_CANCTRL, MCP_MODE_MASK, MCP_MODE_SLEEP);
-	for (int i = 0; i < 10; i++) {
-		if (!mcp_read(MCP_ADDR_CANSTAT, &canstat) &&
-		    (canstat & MCP_MODE_MASK) == MCP_MODE_SLEEP) {
-			mcp_asleep = true;
-			LOG_INF("MCP2515 asleep");
-			return;
-		}
-		k_sleep(K_MSEC(1));
-	}
-	mcp_asleep = true;
-	LOG_WRN("MCP2515 Sleep not confirmed yet (CANSTAT 0x%02X)", canstat);
-}
-
-/*
- * Setting WAKIF by hand wakes the chip as bus activity would, but only with WAKIE set: without it the
- * chip stays asleep and every mode request times out. WAKIE is on just for the wake, and the
- * driver's interrupt handler clears the WAKIF interrupt it doesn't use. The chip restarts its
- * oscillator and comes up in Listen-Only mode; can_start() then returns it to normal mode. Since nothing was received while
- * it slept, it listens for a moment so bus_awake() reflects the bus as it is now. Call with
- * door_mutex held.
- */
 /* The registers that say which mode the chip is in and why a mode change may stall. */
 static void mcp_dump(const char *when)
 {
@@ -216,25 +175,21 @@ static void mcp_dump(const char *when)
 }
 
 /*
- * The driver writes CNF1-3 and CANINTE once, at init. A brown-out or reset of the MCP2515 alone
- * zeroes them while the driver still believes the chip is configured: no interrupt ever fires, so
- * nothing is received and every send times out, and the bitrate is wrong. CANINTE is never 0 once
- * configured, so a 0 there means the chip lost its setup; setting the bitrate again rewrites it all.
- * Call with door_mutex held, after the chip has been started.
+ * Writes the bitrate, CANINTE and the receive buffer setup again, then starts the controller. The
+ * driver only does this at init, so a chip that lost its setup, or that was just powered up, needs
+ * it. Call with door_mutex held.
  */
-static void mcp_restore_config(void)
+static int mcp_configure(void)
 {
-	uint8_t inte = 0;
-
-	if (mcp_read(MCP_ADDR_CANINTE, &inte) || inte != 0) {
-		return;
-	}
-	mcp_dump("lost its configuration");
 	/*
 	 * Not can_set_bitrate(): its default 87.5 % sample point is out of reach with the 8 MHz
 	 * crystal (8 TQ per bit at 500 kbit/s, PS2 >= 2), so it fails with -ERANGE. 75 % fits exactly.
 	 */
 	struct can_timing timing;
+
+	if (!device_is_ready(can_dev)) {
+		return -ENODEV;
+	}
 	int stop_err = can_stop(can_dev);
 	int rate_err = can_calc_timing(can_dev, &timing, DT_PROP(DT_CHOSEN(zephyr_canbus), bitrate),
 				       CAN_SAMPLE_POINT_PERMILLE);
@@ -250,10 +205,32 @@ static void mcp_restore_config(void)
 	int start_err = rate_err ? 0 : can_start(can_dev);
 
 	if (rate_err || start_err) {
-		LOG_ERR("MCP2515 reconfiguration failed (stop %d, bitrate %d, start %d)", stop_err,
+		LOG_ERR("MCP2515 configuration failed (stop %d, bitrate %d, start %d)", stop_err,
 			rate_err, start_err);
-		mcp_dump("after failed reconfiguration");
+		mcp_dump("after failed configuration");
 		can_ready = false;
+		return rate_err ? rate_err : start_err;
+	}
+	can_ready = true;
+	return 0;
+}
+
+/*
+ * The driver writes CNF1-3 and CANINTE once, at init. A brown-out or reset of the MCP2515 alone
+ * zeroes them while the driver still believes the chip is configured: no interrupt ever fires, so
+ * nothing is received and every send times out, and the bitrate is wrong. CANINTE is never 0 once
+ * configured, so a 0 there means the chip lost its setup. Call with door_mutex held, after the chip
+ * has been started.
+ */
+static void mcp_restore_config(void)
+{
+	uint8_t inte = 0;
+
+	if (mcp_read(MCP_ADDR_CANINTE, &inte) || inte != 0) {
+		return;
+	}
+	mcp_dump("lost its configuration");
+	if (mcp_configure()) {
 		return;
 	}
 	LOG_WRN("MCP2515 reconfigured after a reset, listening for bus traffic...");
@@ -261,22 +238,63 @@ static void mcp_restore_config(void)
 	k_sem_take(&rx_sem, K_MSEC(CAN_WAKE_LISTEN_MS));
 }
 
-static void mcp_wake(void)
+/*
+ * Cuts the CAN module's supply between fob sessions (0 uA) through the P-MOS on D7. Its pins are
+ * released first: CS idles high and MOSI may be left high, and either would back-power the module
+ * through the MCP2515's input protection diodes (the PWR LED then lights without VCC). INT is
+ * released too, so the driver's interrupt thread never reads a chip that isn't there. Unpowered,
+ * the SN65HVD230 leaves the bus alone. Call with door_mutex held.
+ */
+static void mcp_power_off(void)
 {
-	mcp_bit_modify(MCP_ADDR_CANINTE, MCP_CANINTE_WAKIE, MCP_CANINTE_WAKIE);
-	mcp_bit_modify(MCP_ADDR_CANINTF, MCP_CANINTF_WAKIF, MCP_CANINTF_WAKIF);
-	k_sleep(K_MSEC(MCP_OSC_START_MS));
-	mcp_bit_modify(MCP_ADDR_CANINTF, MCP_CANINTF_WAKIF, 0);
-	mcp_bit_modify(MCP_ADDR_CANINTE, MCP_CANINTE_WAKIE, 0);
-	mcp_asleep = false;
+	int err;
 
-	if (can_start(can_dev)) {
-		LOG_ERR("MCP2515 wake failed");
-		mcp_dump("after failed start");
+	can_stop(can_dev);
+	can_ready = false;
+	gpio_pin_interrupt_configure_dt(&can_int, GPIO_INT_DISABLE);
+	gpio_pin_configure_dt(&can_int, GPIO_DISCONNECTED);
+	gpio_pin_configure_dt(&mcp_spi.config.cs.gpio, GPIO_DISCONNECTED);
+	/* Applies the SPI's sleep pin state: SCK and MOSI become disconnected inputs. */
+	err = pm_device_action_run(mcp_spi.bus, PM_DEVICE_ACTION_SUSPEND);
+	if (err && err != -EALREADY) {
+		LOG_WRN("CAN SPI suspend failed (err %d)", err);
+	}
+	gpio_pin_set_dt(&can_power, 0);
+	mcp_powered = false;
+	LOG_INF("CAN module off");
+}
+
+/*
+ * Powers the module up for a session and brings the MCP2515 back on the bus. Power-on reset clears
+ * every register, so the chip is reset and configured from scratch, as at boot: there is no Sleep
+ * to wake from. It has missed everything, so it listens for a moment so bus_awake() reflects the
+ * bus as it is now. That adds up to ~1.2 s to the first command or query of a session. Call with
+ * door_mutex held.
+ */
+static void mcp_power_on(void)
+{
+	static const uint8_t reset_cmd = MCP_OPCODE_RESET;
+	const struct spi_buf buf = {.buf = (void *)&reset_cmd, .len = 1};
+	const struct spi_buf_set tx = {.buffers = &buf, .count = 1};
+	int err;
+
+	gpio_pin_set_dt(&can_power, 1);
+	mcp_powered = true;
+	k_sleep(K_MSEC(MCP_POWER_UP_MS));
+	err = pm_device_action_run(mcp_spi.bus, PM_DEVICE_ACTION_RESUME);
+	if (err && err != -EALREADY) {
+		LOG_WRN("CAN SPI resume failed (err %d)", err);
+	}
+	gpio_pin_configure_dt(&mcp_spi.config.cs.gpio, GPIO_OUTPUT_INACTIVE);
+	gpio_pin_configure_dt(&can_int, GPIO_INPUT);
+	gpio_pin_interrupt_configure_dt(&can_int, GPIO_INT_EDGE_TO_ACTIVE);
+
+	spi_write_dt(&mcp_spi, &tx);
+	k_sleep(K_MSEC(MCP_OSC_START_MS));
+	if (mcp_configure()) {
 		return;
 	}
-	can_ready = true;
-	LOG_INF("MCP2515 awake, listening for bus traffic...");
+	LOG_INF("CAN module on, listening for bus traffic...");
 	k_sem_reset(&rx_sem);
 	k_sem_take(&rx_sem, K_MSEC(CAN_WAKE_LISTEN_MS));
 }
@@ -395,8 +413,8 @@ bool door_send(enum door_cmd cmd)
 	bool ok = false;
 
 	k_mutex_lock(&door_mutex, K_FOREVER);
-	if (mcp_asleep) {
-		mcp_wake();
+	if (!mcp_powered) {
+		mcp_power_on();
 	}
 	if (!can_ready) {
 		can_ready = start_can() == 0;
@@ -454,21 +472,18 @@ int door_init(void)
 	}
 #endif
 	can_ready = start_can() == 0;
-	if (!can_ready) {
-		return -ENODEV;
-	}
-	/* No fob yet: the controller sleeps until the first command. */
+	/* No fob yet: the module stays off until the first command or query of a session. */
 	k_mutex_lock(&door_mutex, K_FOREVER);
-	mcp_sleep();
+	mcp_power_off();
 	k_mutex_unlock(&door_mutex);
-	return 0;
+	return can_ready ? 0 : -ENODEV;
 }
 
 void door_sleep(void)
 {
 	k_mutex_lock(&door_mutex, K_FOREVER);
-	if (!mcp_asleep) {
-		mcp_sleep();
+	if (mcp_powered) {
+		mcp_power_off();
 	}
 	k_mutex_unlock(&door_mutex);
 }
@@ -479,8 +494,8 @@ int door_query(uint16_t req_id, const uint8_t req[8], uint16_t rsp_id, uint8_t r
 	int err;
 
 	k_mutex_lock(&door_mutex, K_FOREVER);
-	if (mcp_asleep) {
-		mcp_wake();
+	if (!mcp_powered) {
+		mcp_power_on();
 	}
 	if (!can_ready) {
 		can_ready = start_can() == 0;
@@ -529,48 +544,26 @@ out:
 	return err;
 }
 
-#if BUS_WAKE_ENABLED
-int door_arm_bus_wake(void)
+/*
+ * The driver resets and configures the MCP2515 at boot, before main(), so the module must already
+ * be powered then. door_init() turns it off again. Runs after the GPIO drivers and before the CAN
+ * driver.
+ */
+static int can_power_boot(void)
 {
 	int err;
 
-	k_mutex_lock(&door_mutex, K_FOREVER);
-#if MCP_SLEEP_ENABLED
-	if (!mcp_asleep) {
-		mcp_sleep();
+	if (!gpio_is_ready_dt(&can_power)) {
+		return -ENODEV;
 	}
-	/*
-	 * Bus activity now wakes the chip, which sets WAKIF and pulls INT low. The driver resets the
-	 * MCP2515 at the next boot, which clears WAKIE and WAKIF again.
-	 */
-	err = mcp_bit_modify(MCP_ADDR_CANINTE, MCP_CANINTE_WAKIE, MCP_CANINTE_WAKIE);
-#else
-	/*
-	 * Sleep is off on this module (MCP_SLEEP_ENABLED), so the chip listens instead: Listen-Only
-	 * never ACKs or transmits, and the first standard frame raises the receive interrupt the driver
-	 * enabled at init, which pulls INT low. The transceiver then goes back to standby, where its
-	 * receiver stays on. A few mA, about what Configuration mode already draws between sessions.
-	 */
-	can_stop(can_dev);
-	can_ready = false;
-	err = can_set_mode(can_dev, CAN_MODE_LISTENONLY);
+	err = gpio_pin_configure_dt(&can_power, GPIO_OUTPUT_ACTIVE);
 	if (!err) {
-		err = can_start(can_dev);
+		k_busy_wait(MCP_POWER_UP_MS * USEC_PER_MSEC);
 	}
-	if (!err) {
-		err = can_transceiver_disable(can_phy);
-	}
-#endif
-	if (!err) {
-		/* A level interrupt sets the pin's SENSE, which is what wakes the chip from System OFF. */
-		err = gpio_pin_interrupt_configure_dt(&can_int, GPIO_INT_LEVEL_ACTIVE);
-	}
-	k_mutex_unlock(&door_mutex);
 	return err;
 }
-#else
-int door_arm_bus_wake(void)
-{
-	return -ENOTSUP;
-}
-#endif
+
+BUILD_ASSERT(CONFIG_GPIO_INIT_PRIORITY < CAN_POWER_INIT_PRIORITY &&
+	     CAN_POWER_INIT_PRIORITY < CONFIG_CAN_INIT_PRIORITY,
+	     "the CAN module must be powered after the GPIO drivers start and before the MCP2515 init");
+SYS_INIT(can_power_boot, POST_KERNEL, CAN_POWER_INIT_PRIORITY);
