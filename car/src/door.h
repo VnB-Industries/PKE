@@ -20,16 +20,10 @@ enum door_cmd {
 int door_init(void);
 
 /*
- * Sends the door command, retrying a few times. Wakes the MCP2515 if it sleeps. Thread-safe and blocking:
+ * Sends the door command, retrying a few times. Thread-safe and blocking:
  * an unlock into a sleeping bus can take ~25 s of relay pulses. True when the frame was ACKed.
  */
 bool door_send(enum door_cmd cmd);
-
-/*
- * Puts the MCP2515 in Sleep mode until the next door_send(), which wakes it. While asleep it neither
- * receives nor ACKs, like an empty OBD port.
- */
-void door_sleep(void);
 
 /*
  * Sends one request frame and waits for a reply from an id in [rsp_id, rsp_id + rsp_span). Wakes the

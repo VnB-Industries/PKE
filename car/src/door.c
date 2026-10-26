@@ -25,7 +25,7 @@
 LOG_MODULE_REGISTER(door, LOG_LEVEL_INF);
 
 static const struct device *const can_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_canbus));
-/* Raw access to the same chip, for the Sleep mode the Zephyr driver doesn't offer. */
+/* Raw access to the same chip, for the register reads the Zephyr driver doesn't offer. */
 static const struct spi_dt_spec mcp_spi =
 	SPI_DT_SPEC_GET(DT_CHOSEN(zephyr_canbus), SPI_OP_MODE_MASTER | SPI_WORD_SET(8));
 #if RELAY_WAKE_ENABLED
@@ -39,7 +39,6 @@ static K_SEM_DEFINE(rx_sem, 0, 1);
 static K_SEM_DEFINE(query_sem, 0, 1);
 
 static bool can_ready;
-static bool mcp_asleep;
 static int filter_id = -1;
 static int tx_err;
 static uint8_t reply[4];
@@ -149,45 +148,6 @@ static int mcp_read(uint8_t addr, uint8_t *value)
 	return err;
 }
 
-/*
- * Puts the MCP2515 in Sleep mode, a few uA. can_stop() first aborts any pending frame and tells the
- * driver it is stopped. WAKIE stays off outside mcp_wake(), so bus activity doesn't wake the chip.
- * The chip only enters Sleep once the bus is idle, which can take longer than the check below, so it
- * counts as asleep either way: mcp_wake() on a chip that is already awake does no harm, while a
- * mode request to a sleeping chip times out. Call with door_mutex held.
- */
-static void mcp_sleep(void)
-{
-	uint8_t canstat = 0;
-
-	can_stop(can_dev);
-	can_ready = false;
-	if (!MCP_SLEEP_ENABLED) {
-		/* Configuration mode: off the bus, and the next start needs no wake. */
-		return;
-	}
-	mcp_bit_modify(MCP_ADDR_CANCTRL, MCP_MODE_MASK, MCP_MODE_SLEEP);
-	for (int i = 0; i < 10; i++) {
-		if (!mcp_read(MCP_ADDR_CANSTAT, &canstat) &&
-		    (canstat & MCP_MODE_MASK) == MCP_MODE_SLEEP) {
-			mcp_asleep = true;
-			LOG_INF("MCP2515 asleep");
-			return;
-		}
-		k_sleep(K_MSEC(1));
-	}
-	mcp_asleep = true;
-	LOG_WRN("MCP2515 Sleep not confirmed yet (CANSTAT 0x%02X)", canstat);
-}
-
-/*
- * Setting WAKIF by hand wakes the chip as bus activity would, but only with WAKIE set: without it the
- * chip stays asleep and every mode request times out. WAKIE is on just for the wake, and the
- * driver's interrupt handler clears the WAKIF interrupt it doesn't use. The chip restarts its
- * oscillator and comes up in Listen-Only mode; can_start() then returns it to normal mode. Since nothing was received while
- * it slept, it listens for a moment so bus_awake() reflects the bus as it is now. Call with
- * door_mutex held.
- */
 /* The registers that say which mode the chip is in and why a mode change may stall. */
 static void mcp_dump(const char *when)
 {
@@ -249,26 +209,6 @@ static void mcp_restore_config(void)
 		return;
 	}
 	LOG_WRN("MCP2515 reconfigured after a reset, listening for bus traffic...");
-	k_sem_reset(&rx_sem);
-	k_sem_take(&rx_sem, K_MSEC(CAN_WAKE_LISTEN_MS));
-}
-
-static void mcp_wake(void)
-{
-	mcp_bit_modify(MCP_ADDR_CANINTE, MCP_CANINTE_WAKIE, MCP_CANINTE_WAKIE);
-	mcp_bit_modify(MCP_ADDR_CANINTF, MCP_CANINTF_WAKIF, MCP_CANINTF_WAKIF);
-	k_sleep(K_MSEC(MCP_OSC_START_MS));
-	mcp_bit_modify(MCP_ADDR_CANINTF, MCP_CANINTF_WAKIF, 0);
-	mcp_bit_modify(MCP_ADDR_CANINTE, MCP_CANINTE_WAKIE, 0);
-	mcp_asleep = false;
-
-	if (can_start(can_dev)) {
-		LOG_ERR("MCP2515 wake failed");
-		mcp_dump("after failed start");
-		return;
-	}
-	can_ready = true;
-	LOG_INF("MCP2515 awake, listening for bus traffic...");
 	k_sem_reset(&rx_sem);
 	k_sem_take(&rx_sem, K_MSEC(CAN_WAKE_LISTEN_MS));
 }
@@ -387,9 +327,6 @@ bool door_send(enum door_cmd cmd)
 	bool ok = false;
 
 	k_mutex_lock(&door_mutex, K_FOREVER);
-	if (mcp_asleep) {
-		mcp_wake();
-	}
 	if (!can_ready) {
 		can_ready = start_can() == 0;
 	}
@@ -445,24 +382,9 @@ int door_init(void)
 		return err;
 	}
 #endif
+	/* The controller stays on the bus from here on: the CAN module isn't power-managed. */
 	can_ready = start_can() == 0;
-	if (!can_ready) {
-		return -ENODEV;
-	}
-	/* No fob yet: the controller sleeps until the first command. */
-	k_mutex_lock(&door_mutex, K_FOREVER);
-	mcp_sleep();
-	k_mutex_unlock(&door_mutex);
-	return 0;
-}
-
-void door_sleep(void)
-{
-	k_mutex_lock(&door_mutex, K_FOREVER);
-	if (!mcp_asleep) {
-		mcp_sleep();
-	}
-	k_mutex_unlock(&door_mutex);
+	return can_ready ? 0 : -ENODEV;
 }
 
 int door_query(uint16_t req_id, const uint8_t req[8], uint16_t rsp_id, uint8_t rsp_span,
@@ -471,9 +393,6 @@ int door_query(uint16_t req_id, const uint8_t req[8], uint16_t rsp_id, uint8_t r
 	int err;
 
 	k_mutex_lock(&door_mutex, K_FOREVER);
-	if (mcp_asleep) {
-		mcp_wake();
-	}
 	if (!can_ready) {
 		can_ready = start_can() == 0;
 	}
