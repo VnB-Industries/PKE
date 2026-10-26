@@ -75,7 +75,7 @@ Noter aussi : **l'alarme sonne-t-elle ?** Elle ne doit pas (l'observation préc�
 
 À faire seulement si le Test A est concluant.
 
-**Câblage :** contacts du relais **en parallèle** du contacteur de montant conducteur. La ligne est à un état haut via le pull-up interne du body ECU (porte fermée) et mise à la masse par le corps métallique du contacteur (porte ouverte). Fermer le relais met la ligne à la masse = « porte ouverte » ; l'ouvrir la laisse remonter au pull-up = « porte fermée ». (Détails fil/topologie/contrôles carte : `Pin-diagram.md`.)
+**Câblage :** contacts du relais **en parallèle** du contacteur de montant conducteur. La ligne est à un état haut via le pull-up interne du body ECU (porte fermée) et mise à la masse par le corps métallique du contacteur (porte ouverte). Fermer le relais met la ligne à la masse = « porte ouverte » ; l'ouvrir la laisse remonter au pull-up = « porte fermée ». (Câblage détaillé : README, section « Relay wake is integrated into the firmware ».)
 
 **Séquence d'impulsions** — ne pas pulser une seule fois. La procédure Toyota pour un body ECU endormi est : ouvrir la porte conducteur, puis ouvrir/fermer une porte **plusieurs fois à ~1,5 s d'intervalle**. Donc un **train** :
 

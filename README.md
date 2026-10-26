@@ -6,7 +6,7 @@ Full Passive Entry System for a 2018 Lexus CT200h, on two Seeed XIAO nRF52840 (P
 - **Car unit**: resolves the fob, authenticates it, then unlocks and locks the doors over CAN (MCP2515 on the OBD port). It wakes a body ECU in deep sleep by pulsing a relay on the driver's door jamb switch.
 - **Window taps** (INMP441 mic on the glass, car unit) give manual control: double tap = unlock, triple tap = lock. **The mic only runs while an authenticated fob is connected**, so a tap on its own can never open the car.
 
-The earlier ESP32 Arduino firmware (tap-only, no BLE) is on the `ESP32/main` branch. The BLE/UWB groundwork came from the BLEUWB project.
+The car unit is also ported to an ESP32 DevKit on the `ESP32/main` branch, with proximity-only authentication and the same fob. The earlier ESP32 Arduino firmware (tap-only, no BLE) is on the `ESP32/old_tapdetect` branch. The BLE/UWB groundwork came from the BLEUWB project.
 
 | Directory | Contents |
 | --- | --- |
@@ -38,7 +38,7 @@ The pins are set in [car/app.overlay](car/app.overlay). Set `osc-freq` there to 
 - **Don't power the CAN module from the XIAO's 3V3 pin**: the XIAO's regulator holds 3.3 V at rest, but it can't deliver the SN65HVD230's current bursts when it transmits. Measured on the car: from the XIAO's 3V3, every transmitted frame failed with bit errors (`TXB0CTRL 18`) and the MCP2515 went bus-off, while receiving still worked. The same module powered from another 3.3 V supply transmitted fine with the same XIAO and firmware. The weak supply also left the MCP2515 unconfigured at boot (`CNF 00 00 00`, `CANINTE 00`), which the firmware now detects and repairs (`mcp_restore_config()` in [car/src/door.c](car/src/door.c)). Feed the module from its own 3.3 V regulator (e.g. an MCP1700 or AMS1117-3.3), with its GND tied to the XIAO's GND, and put 47–100 µF plus 100 nF across VCC/GND at the module.
 - **The MOSI line back-powers the module**: with the module's VCC disconnected, its PWR LED still lights, fed from MOSI through the MCP2515's input protection diode. Don't run it that way: check that VCC is really connected.
 - **D7 to Rs**: most SN65HVD230 modules tie Rs to GND. Cut that link, or remove the resistor, before connecting D7. Otherwise, driving D7 high shorts the pin. Details are under [Power](#power).
-- **No front pin left for UWB**: D0–D10 are all taken. The DW3000 will need CS, IRQ and RST on the back pads of the XIAO Plus (D11/P0.15, D12/P0.19 and D13/P1.01 are free), plus the shared SPI bus on D8/D9/D10. If you want UWB later, route those pads now, before the enclosure is closed. Power the module from 3V3: it draws 72 mA peaks from the same LDO as the rest of the unit.
+- **No UWB on this wiring**: D0–D10 are all taken. UWB will come with a dedicated carrier PCB for the XIAO and the UWB3000F00 module, which has its own pinout, so the overlay will change then. Until that board is made, don't wire a DW3000 to this unit.
 
 ## Hardware (fob)
 
@@ -234,7 +234,7 @@ There is no secret wake frame. Per ISO 11898-2 a transceiver leaves standby on a
 
 `REC=0` means not one bit ever came back, and no amount of bus activity changed that. The reason is that **a Toyota main body ECU wakes on its hardwired inputs — the door courtesy switches — not on CAN activity.** Toyota's own service procedure for a sleeping main body ECU is physical: with the engine switch off, open the driver door, then open and close a door several times at ~1.5 s intervals. Bus wake-up is a feature of partial-networking transceivers on newer platforms; this one doesn't have it.
 
-So the CAN wake was not ported to the nRF52840 firmware. The ESP32 version, with `WAKE_BUS_ENABLED`, is still on the `ESP32/main` branch for platforms where it does work.
+So the CAN wake was not ported to the nRF52840 firmware. The ESP32 version, with `WAKE_BUS_ENABLED`, is still on the `ESP32/old_tapdetect` branch for platforms where it does work.
 
 ### What the error flags mean
 
@@ -283,7 +283,7 @@ The fix is to wake the body ECU the way the car does: **drive its hardwired wake
 
 ### The jamb switch line
 
-A single wire at battery voltage: the body ECU holds one state through an internal pull-up, and the switch's own metal body grounds it to the jamb in the other. A relay wired across that switch and pulsed makes the ECU see a door opening. Wiring, the topology measurement and the board checks are in [../Pin-diagram.md](../Pin-diagram.md); the pulse is implemented as the `wake` command in [../obd-tool](../obd-tool/README.md).
+A single wire at battery voltage: the body ECU holds one state through an internal pull-up, and the switch's own metal body grounds it to the jamb in the other. A relay wired across that switch and pulsed makes the ECU see a door opening. Wiring is under [Relay wake is integrated into the firmware](#relay-wake-is-integrated-into-the-firmware), and the on-car checks are in [tests/reveil-ecu-relais.md](tests/reveil-ecu-relais.md); the pulse is implemented as the `wake` command in [../obd-tool](../obd-tool/README.md).
 
 Pulse a train, not once — Toyota's service procedure for a sleeping main body ECU is *open the driver door, then open and close a door several times at ~1.5 s intervals*.
 
