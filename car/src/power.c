@@ -5,10 +5,9 @@
  * internal pull-up) takes a push button to GND, or the driver's jamb-switch
  * line through a diode: opening the door grounds the line and pulls the input
  * low, while the diode blocks the line's battery voltage when the door is
- * closed. CAN bus activity can wake it too (BUS_WAKE_ENABLED,
- * door_arm_bus_wake()). Outside a session the MCP2515 is already stopped, the
- * mic unclocked and the relay released, so System OFF only has to stop the
- * radio and the CPU.
+ * closed. It is the only way out of System OFF: the CAN module is unpowered
+ * outside a session, so the bus can't wake the unit. The mic is unclocked and
+ * the relay released too, so System OFF only has to stop the radio and the CPU.
  */
 #include <errno.h>
 
@@ -18,7 +17,6 @@
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/sys/poweroff.h>
 
-#include "door.h"
 #include "power.h"
 
 LOG_MODULE_REGISTER(power, LOG_LEVEL_INF);
@@ -27,10 +25,8 @@ static const struct gpio_dt_spec wake = GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), w
 
 static struct gpio_callback wake_cb;
 static K_SEM_DEFINE(wake_sem, 0, 1);
-/* Something can bring the unit back from System OFF: the wake input, the CAN bus, or both. */
+/* The wake input is set up, so something can bring the unit back from System OFF. */
 static bool wake_ok;
-static bool input_ok;
-static bool bus_wake;
 static int64_t last_activity_ms;
 
 static void wake_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
@@ -38,13 +34,11 @@ static void wake_isr(const struct device *dev, struct gpio_callback *cb, uint32_
 	k_sem_give(&wake_sem);
 }
 
-int power_init(bool can_ok)
+int power_init(void)
 {
 	int err;
 
 	last_activity_ms = k_uptime_get();
-	bus_wake = BUS_WAKE_ENABLED && can_ok;
-	wake_ok = bus_wake;
 	if (!gpio_is_ready_dt(&wake)) {
 		return -ENODEV;
 	}
@@ -60,7 +54,6 @@ int power_init(bool can_ok)
 	if (err) {
 		return err;
 	}
-	input_ok = true;
 	wake_ok = true;
 	LOG_INF("deep idle after %d h without a session, System OFF after %d h",
 		POWER_DEEP_IDLE_AFTER_S / 3600, POWER_OFF_AFTER_S / 3600);
@@ -110,27 +103,14 @@ bool power_wait_wake(k_timeout_t timeout)
 
 void power_off(void)
 {
-	if (bus_wake) {
-		int err = door_arm_bus_wake();
-
-		if (err) {
-			LOG_ERR("CAN bus wake failed (err %d)", err);
-			bus_wake = false;
-			wake_ok = input_ok;
-			if (!wake_ok) {
-				LOG_ERR("nothing could wake the unit, staying in deep idle");
-				return;
-			}
-		}
+	if (!wake_ok) {
+		LOG_ERR("nothing could wake the unit, staying in deep idle");
+		return;
 	}
-	if (input_ok) {
-		/* A level interrupt sets the pin's SENSE, which is what wakes the chip from System OFF. */
-		gpio_pin_interrupt_configure_dt(&wake, GPIO_INT_LEVEL_ACTIVE);
-	}
-	LOG_INF("no fob session for %d h, entering System OFF until %s", POWER_OFF_AFTER_S / 3600,
-		input_ok && bus_wake ? "the wake input or CAN activity"
-		: bus_wake	     ? "CAN activity"
-				     : "the wake input");
+	/* A level interrupt sets the pin's SENSE, which is what wakes the chip from System OFF. */
+	gpio_pin_interrupt_configure_dt(&wake, GPIO_INT_LEVEL_ACTIVE);
+	LOG_INF("no fob session for %d h, entering System OFF until the wake input",
+		POWER_OFF_AFTER_S / 3600);
 	LOG_PANIC();
 	sys_poweroff();
 }
