@@ -338,7 +338,8 @@ static void sync_driving(bool driving, bool *link_slow, bool *fob_told)
 
 /*
  * Step 6: polls the link RSSI until the driver walks away with the car parked, or the link ends.
- * While the car is driven, the RSSI is ignored and the link runs slow (sync_driving()).
+ * While the car is driven, the RSSI is ignored, the link runs slow (sync_driving()) and the mic is
+ * off.
  */
 static enum exit_cause wait_for_exit(void)
 {
@@ -369,7 +370,15 @@ static enum exit_cause wait_for_exit(void)
 			return EXIT_LINK_LOST;
 		}
 		if (ticks++ % VEHICLE_POLL_EVERY == 0) {
+			bool was_driving = driving;
+
 			driving = vehicle_poll() == VEHICLE_DRIVING;
+			/* No tap gestures on the move: the mic listens only while parked or off. */
+			if (driving && !was_driving) {
+				tap_listener_stop();
+			} else if (!driving && was_driving) {
+				tap_listener_start();
+			}
 			sync_driving(driving, &link_slow, &fob_told);
 		}
 		if (driving || link_slow || fob_told) {

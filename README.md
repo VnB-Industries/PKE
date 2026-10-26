@@ -95,7 +95,7 @@ The onboard RGB LED is used only at boot: a ~0.7 s red-green-blue chase then a w
 1. **Enrollment**: `scripts/gen_keys.py` creates the shared secret, the fob IRK and the fob static identity address. They are compiled into both firmwares.
 2. **Discovery**: the fob's RPA rotates every 60 s (`CONFIG_BT_RPA_TIMEOUT`, short for testing). The car resolves it on the host with AES-ECB. It connects once the filtered advert RSSI holds -70 dBm for 3 samples.
 3. **Authenticated exchange**: the link is encrypted with LE Secure Connections Just Works, without bonding. On top of it, both sides prove they hold the secret with HMAC-SHA256 over two fresh nonces, then derive a session key with HKDF-SHA256. Both log the same `key id`, a hash prefix of the key, never the key itself.
-4. **Mic on**: the car starts the tap listener. It stops again when the session ends, whether by a lock or a lost link. The MCP2515 stays on the bus.
+4. **Mic on**: the car starts the tap listener. It stops again when the session ends, whether by a lock or a lost link, and while the car is being driven (see [Driving mode](#driving-mode)). The MCP2515 stays on the bus.
 5. **UWB ranging**: dummy for now, and it always passes ([ranging.c](car/src/ranging.c)).
 6. **Unlock**: off for now (`AUTO_UNLOCK_ENABLED` 0 in [car/src/main.c](car/src/main.c)): the session skips this step, and the doors open with a double tap or the original key. When enabled, the car sends the unlock frame ([door.c](car/src/door.c)), with the relay wake if the bus is asleep. The session stays up even if delivery failed; a double tap retries it. While the car is being driven there is no automatic unlock, so a fob reconnecting mid-drive never opens the doors (see [Driving mode](#driving-mode)).
 7. **Exit detection**: the car polls the link RSSI every 250 ms. An exit starts when the filtered RSSI stays below -80 dBm for 5 samples. It only counts while the car is not being driven: the car polls the vehicle state over OBD-II once a second ([vehicle.c](car/src/vehicle.c)), and while driving it ignores the RSSI and slows the link (see [Driving mode](#driving-mode)).
@@ -187,8 +187,9 @@ While driving:
 1. The car sends `DRIVE 1` to the fob while the link is still fast. The fob then stops its rest timer.
 2. The car switches the link to a 1 s interval with peripheral latency 4 and a 16 s supervision timeout. The fob's radio wakes every 5 s.
 3. The car ignores the link RSSI, so no exit can start.
+4. The car stops the tap listener, so the mic is unclocked for the whole drive. It starts again as soon as the car counts as parked or off. With the gear check enabled, leaving P is enough to stop it.
 
-When the car stops being driven, the car restores the default link (30–50 ms) and then sends `DRIVE 0`. Exit detection resumes once both are done.
+When the car stops being driven, the car restarts the mic, restores the default link (30–50 ms) and then sends `DRIVE 0`. Exit detection resumes once both are done.
 
 Estimated fob current for the chip alone (board leakage comes on top): ~200 µA on the default link, ~5 µA on the driving link.
 
