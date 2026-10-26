@@ -35,13 +35,6 @@ static const uint8_t UNLOCK_CMD_DATA[8] = {0x40, 0x05, 0x30, 0x11, 0x00, 0x40, 0
  */
 #define BUS_AWAKE_TIMEOUT_MS 2000
 
-/* ---- MCP2515 Sleep mode (door_sleep()) ---- */
-/*
- * After a wake the chip has missed everything, so listen this long before judging the bus. The
- * gateway's NM frame ticks ~1 Hz while the bus is responsive.
- */
-#define CAN_WAKE_LISTEN_MS 1200
-
 /* ---- Relay wake (drives the driver's-door jamb-switch line to wake a sleeping body ECU) ---- */
 /*
  * In deep sleep (~10+ min idle) the body ECU no longer listens on CAN, so no frame can reach it

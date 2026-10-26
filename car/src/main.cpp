@@ -197,7 +197,6 @@ static void run_session(int rssi)
 	} while (!locked && seen);
 
 	tap_listener_stop();
-	door_sleep();
 }
 
 void setup()

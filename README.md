@@ -47,7 +47,7 @@ No LEDs are used. Everything is reported on the USB serial log.
 1. **Enrollment**: `scripts/gen_keys.py` creates the fob IRK and its static identity address (plus the shared secret, which only the nRF car firmware uses). The fob is built with them; the car only needs the IRK.
 2. **Detection and unlock**: the fob's RPA rotates every 60 s (`CONFIG_BT_RPA_TIMEOUT` in the fob build, short for testing). The car scans passively and continuously, and resolves each RPA advert on the host with AES-128 (ESP32 hardware AES through mbedTLS). Once the filtered advert RSSI holds -70 dBm for 3 adverts, it starts the tap listener and sends the unlock frame ([door.cpp](car/src/door.cpp)), with the relay wake if the bus is asleep. The session stays up even if delivery failed; a double tap retries it.
 3. **Exit detection**: the car keeps following the fob's adverts. An exit starts when the filtered RSSI stays below -80 dBm for 5 adverts, or when no advert arrives for 3 s. The vehicle precondition ([vehicle.cpp](car/src/vehicle.cpp)) is a stub that always returns true.
-4. **Lock**: on an exit the car sends the lock frame. If the lock failed and the fob is still heard, it waits for the next exit trigger; if the fob is gone, the session ends anyway. The tap listener stops, the MCP2515 goes back to Sleep, and the car searches again after 2 s. The 10 dB gap between the detect and exit thresholds stops it from flapping.
+4. **Lock**: on an exit the car sends the lock frame. If the lock failed and the fob is still heard, it waits for the next exit trigger; if the fob is gone, the session ends anyway. The tap listener stops, and the car searches again after 2 s. The 10 dB gap between the detect and exit thresholds stops it from flapping.
 
 BLE thresholds are `#define`s at the top of [car/src/main.cpp](car/src/main.cpp). Door frames, retries and relay timings are in [car/src/door_config.h](car/src/door_config.h).
 
@@ -68,15 +68,7 @@ The ESP32 scans continuously, so the car unit draws on the order of 100 mA all t
 
 What is kept from the nRF version: there are no LEDs, the I2S clock runs only while the fob is detected, and the relay dwell blocks on a semaphore instead of polling.
 
-The MCP2515 sleeps outside a fob session, at a few µA. `setMode(MCP_SLEEP)` from mcp_can sets REQOP in CANCTRL to Sleep (`0x20`). WAKIE stays off, so bus traffic can't wake it. The first `door_send()` of a session wakes it with `setMode(MCP_NORMAL)`:
-1. mcp_can sets WAKIF in CANINTF.
-2. The chip restarts its crystal and comes up in Listen-Only mode.
-3. mcp_can switches it to normal mode.
-4. The firmware listens for up to 1.2 s, so the bus-awake check sees the bus as it is now.
-
-That adds up to ~1.2 s to the first unlock of a session. At the end of the session, `door_sleep()` puts it back to sleep. While asleep it doesn't ACK, the same as an empty OBD port.
-
-The CAN transceiver module stays powered, and its draw depends on how its standby pin (Rs) is wired.
+The CAN module isn't power-managed on this branch (decided on 26/10): no MCP2515 Sleep and no transceiver standby. The controller goes on the bus at boot and stays there in normal mode, ACKing and receiving every frame, so the bus-awake check always reflects the bus. Leave the SN65HVD230's Rs tied to GND, as the module ships. Its few mA are small next to the ESP32's scan.
 
 ## Waking a sleeping bus
 
