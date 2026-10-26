@@ -475,7 +475,6 @@ static void run_session(const bt_addr_le_t *fob)
 	}
 
 	tap_listener_stop();
-	door_sleep();
 	memset(session_key, 0, sizeof(session_key));
 }
 
