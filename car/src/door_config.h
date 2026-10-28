@@ -58,8 +58,9 @@ static const uint8_t UNLOCK_CMD_DATA[8] = {0x40, 0x05, 0x30, 0x11, 0x00, 0x40, 0
 #define MCP_ADDR_TEC          0x1C
 #define MCP_OSC_START_MS      5    /* crystal start-up after a reset, before talking to the chip */
 /*
- * Supply rise (~1 ms with the board's 100 nF gate capacitor), the module's decoupling and the
- * MCP2515's power-on reset, before the first SPI transfer.
+ * Supply rise (~4 ms with the 1 uF gate capacitor C4 of the rev E-PB-stock board), the module's
+ * decoupling and the MCP2515's power-on reset, before the first SPI transfer. Keep it at 10 ms or
+ * more.
  */
 #define MCP_POWER_UP_MS       10
 /* Powers the module at boot after the GPIO drivers (40) and before the MCP2515 driver (80). */
