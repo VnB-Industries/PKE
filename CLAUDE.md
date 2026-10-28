@@ -29,7 +29,7 @@ Pas d'UWB ici : toutes les broches du bord sont prises. Le travail UWB et la cou
 - Code et commentaires en anglais, style Zephyr (tabulations, `LOG_*`), réglages dans `*_config.h`.
 - Le CAN ne réveille pas la voiture (ECU carrosserie Toyota) : réveil par relais sur le contacteur de montant (`RELAY_WAKE_ENABLED`).
 - Parking : scan BLE à 50 % pendant 2 jours, 1 s toutes les 60 s jusqu'à 4 jours, puis System OFF. Seule l'entrée D6 en sort.
-- **Hors périmètre de cette branche (développement)** : réveil de l'unité par la ligne du contacteur de porte sur D6. C'est une fonction finale, prévue sur `nrf52840/UWB` (D14, J1 broche 11 de la carte). Ne pas la câbler ni l'étendre ici.
+- **Hors périmètre de cette branche (développement)** : réveil de l'unité par la ligne du contacteur de porte sur D6. C'est une fonction finale, prévue sur `nrf52840/UWB` (D14 = P0.09 actif bas, J1 broche 12 de la carte, BAT54 hors carte côté ligne du contacteur). Ne pas la câbler ni l'étendre ici.
 - Les sources de `car/src/tap/` viennent du dépôt tapDetector : les recopier plutôt que les modifier ici.
 
 ## À faire (firmware)
